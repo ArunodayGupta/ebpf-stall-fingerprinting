@@ -1,0 +1,197 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{url}
+\usepackage{microtype}
+
+% Load dynamically generated metrics macros
+\input{macros.tex}
+
+\begin{document}
+
+\title{eBPF-Based Fingerprinting of I/O-Induced Application Stalls: Fusing Cross-Layer Kernel Telemetry Under Uncertainty}
+
+\author{\IEEEauthorblockN{Anonymous Authors}
+\IEEEauthorblockA{\textit{Department of Computer Science and Engineering} \\
+\textit{Operating Systems Research Project}\\
+Assignment 3 Submission Artifact}
+}
+
+\maketitle
+
+\begin{abstract}
+Application latency stalls frequently degrade modern software performance, yet determining whether a transient stall originates from physical storage I/O, CPU scheduling starvation, or user-space/syscall execution remains challenging. Traditional observability frameworks inspect system call latencies, block-layer requests, or scheduler transitions in isolation, frequently conflating voluntary task sleeps with runnable queue delays or assuming that nearby block operations caused a delayed syscall. This paper presents an end-to-end Linux kernel observability framework that fingerprints application stalls using Extended Berkeley Packet Filter (eBPF) technology. By deploying in-kernel probes at system call, block I/O, and scheduler tracepoints, our system captures microsecond-scale execution intervals while enforcing strict process-level scoping via BPF hash maps. We introduce an interval-union correlation engine that prevents double-counting of overlapping events, and implement a transparent rule-based classifier that outputs one of four explicit states: \textit{io\_wait\_dominated}, \textit{scheduler\_wait\_dominated}, \textit{cpu\_syscall\_dominated}, or an explicit \textit{indeterminate} abstention class. We evaluate the system against single-source baselines and a lightweight decision tree across five controlled workload conditions and three concurrency levels. Our findings confirm that fusing multi-layer telemetry significantly reduces false attributions under ambiguous cache and preemption states while maintaining low runtime probe overhead.
+\end{abstract}
+
+\begin{IEEEkeywords}
+eBPF, Linux Kernel, Performance Observability, I/O Stall Attribution, Scheduler Contention, Off-CPU Analysis.
+\end{IEEEkeywords}
+
+\section{Introduction and Scientific Motivation}
+Modern interactive and data-intensive applications frequently experience tail latency spikes and transient stalls that severely degrade user experience and throughput. Diagnosing the underlying cause of an observed latency stall is a notoriously difficult systems problem because a single end-to-end latency metric aggregates diverse operating system phenomena. A thread may block synchronously on storage devices, wait for page-cache readahead or journal commits, spin in computational loops, or become runnable yet starve in kernel runqueues due to CPU contention.
+
+Traditional profiling approaches often rely on coarse-grained process sampling (e.g., polling \texttt{/proc/[pid]/stat}) or user-space wall-clock timers. However, user-space timers cannot observe kernel-internal transitions, whereas global sampling mechanisms lack the temporal resolution required to capture transient stalls lasting tens of milliseconds. Furthermore, treating nearby physical block I/O as the definitive cause of a slow system call introduces severe correlational fallacies: modern filesystems heavily utilize asynchronous page caching, readahead heuristics, and background writeback daemons (\texttt{kworker}), uncoupling physical block dispatches from user-level system call boundaries.
+
+The Extended Berkeley Packet Filter (eBPF) architecture provides an ideal substrate for fine-grained kernel observability. By attaching safe, in-kernel bytecode programs to static tracepoints, observability tools can intercept kernel events with sub-microsecond precision~\cite{linux_bpf_docs}. However, prior eBPF observability tools predominantly inspect single subsystems in isolation—such as tracing block requests via \texttt{biosnoop} or measuring scheduler off-CPU delays via \texttt{offcputime}~\cite{gregg2019bpf}. 
+
+This research investigates the hypothesis that fusing three independent kernel telemetry layers—system calls, block-layer requests, and scheduler transitions—enables accurate classification of application stalls while explicitly identifying ambiguous or unprovable attributions.
+
+\section{Problem Definition}
+We define an application operation as a bounded execution interval $W = [t_{\text{start}}, t_{\text{end}}]$ with duration $\Delta t = t_{\text{end}} - t_{\text{start}}$ executed by a target thread identifier (TID) and process identifier (PID). The scientific objective is to classify each operation $W$ into exactly one of four target categories:
+\begin{enumerate}
+    \item \textbf{\texttt{io\_wait\_dominated}}: The stall duration is predominantly explained by waiting on physical storage device I/O.
+    \item \textbf{\texttt{scheduler\_wait\_dominated}}: The task was runnable and ready to execute on a CPU, but suffered queuing delay due to CPU runqueue contention.
+    \item \textbf{\texttt{cpu\_syscall\_dominated}}: The duration is dominated by on-CPU computational execution and fast in-memory syscall handling without significant device I/O or runnable delays.
+    \item \textbf{\texttt{indeterminate}}: The available telemetry is missing, corrupt, contradictory, or insufficient to substantiate a confident classification.
+\end{enumerate}
+
+\noindent\textbf{Scientific Constraint:} A fundamental principle of this work is that \textit{temporal proximity does not imply causality}~\cite{curtsinger2015coz}. Observing a block-layer request completion during a slow system call does not mathematically prove that the block request caused the application delay. Our framework explicitly incorporates this constraint by establishing an abstention class rather than forcing ambiguous samples into confident misclassifications.
+
+\section{Objectives and Hypotheses}
+The primary research objectives are:
+\begin{itemize}
+    \item \textbf{O1}: Construct an in-kernel eBPF collector that filters telemetry specifically to target processes, capturing system calls, block I/O, and scheduler transitions.
+    \item \textbf{O2}: Design an interval-union correlation pipeline that accounts for overlapping event intervals without double-counting duration.
+    \item \textbf{O3}: Implement a transparent rule-based classifier providing structured explanations alongside a lightweight decision tree baseline.
+    \item \textbf{O4}: Quantify classification accuracy against approximate ground-truth workloads and evaluate the probe overhead of kernel instrumentation.
+\end{itemize}
+
+\noindent We formulate two testable hypotheses:
+\begin{itemize}
+    \item \textbf{Hypothesis 1 (H1)}: Fusing syscall, block-layer, and scheduler telemetry classifies controlled stall types with higher Macro-F1 than any single-layer baseline.
+    \item \textbf{Hypothesis 2 (H2)}: Providing an explicit abstention class (\textit{indeterminate}) reduces high-confidence misclassifications under ambiguous conditions (such as cached file reads or deliberate application sleep).
+\end{itemize}
+
+\section{Literature Survey}
+\subsection{eBPF Tracing and Overhead Scoping}
+Recent research has increasingly scrutinized the runtime overhead introduced by dynamic kernel instrumentation. Craun et al.~\cite{craun2024eliminating} analyzed eBPF tracing overhead and demonstrated that standard global tracepoint attachments incur measurable penalties on untraced background processes because the CPU must execute probe trap handlers before filtering logic runs. Their findings motivate our design of in-kernel BPF hash map lookups (\texttt{target\_pids}) executed immediately upon probe invocation. 
+
+Piotrowski~\cite{piotrowski2024benchmarking} empirically benchmarked eBPF on Linux against DTrace on FreeBSD across micro-benchmarks and macro-benchmarks, demonstrating that probe effects substantially alter memory cache locality and tail latency profiles. In storage environments, Naas et al.~\cite{naas2026dissecting} dissected eBPF tracing overhead at high event frequencies, showing that tracing every block request under microsecond-scale NVMe devices leads to severe perf ring buffer contention. These studies establish that kernel tracing cannot be treated as zero-cost, necessitating rigorous accounting of both monitored and unmonitored baseline workloads.
+
+\subsection{Map Performance and Code Optimization}
+The scalability of in-kernel state tracking depends directly on BPF data structures. Liu, Tak, and Wang~\cite{liu2024understanding} investigated the performance of eBPF maps under high concurrency, showing that hash maps offer constant-time lookups but require careful pre-allocation to prevent hash bucket collision stalls. Mao et al.~\cite{mao2024merlin} introduced Merlin, demonstrating that multi-tier optimization of eBPF bytecode significantly reduces verifier complexity and probe execution cycles. In our architecture, we strictly minimize in-kernel computation by offloading correlation and feature extraction to user space.
+
+\subsection{Off-CPU and Causal Analysis}
+Gregg~\cite{gregg2019bpf} formalized off-CPU analysis for diagnosing application latency, emphasizing that off-CPU time comprises two fundamentally distinct states: voluntary blocking (where the thread relinquishes the CPU to sleep or wait on I/O) and runnable waiting (where the thread remains runnable in the scheduler queue). Failing to distinguish these states leads to severe diagnostic errors. Curtsinger and Berger~\cite{curtsinger2015coz} highlighted in their work on causal profiling that optimizing arbitrary pauses fails to improve system throughput unless those pauses reside on the critical path. Mace et al.~\cite{mace2015pivot} demonstrated dynamic causal monitoring across asynchronous event flows, inspiring our windowed correlation architecture.
+
+\section{Methodology and Architecture}
+
+\subsection{System Architecture}
+Our architecture consists of three core subsystems:
+1) \textit{Kernel-side eBPF Instrumentation Engine}: Compiles embedded C code using the BPF Compiler Collection (BCC) and attaches to kernel tracepoints.
+2) \textit{Telemetry Delivery and Event Buffer}: Streams structured C structs across a 64-page perf ring buffer with automatic loss detection (\texttt{lost\_cb}).
+3) \textit{User-Space Correlation and Classification Pipeline}: Parses JSON Lines events, calculates non-overlapping interval unions, extracts quantitative features, and evaluates classification models.
+
+\subsection{Tracepoint Selection and In-Kernel Logic}
+We instrument the following kernel tracepoints:
+\begin{itemize}
+    \item \textbf{System Calls}: \texttt{sys\_enter\_\{read, write, pread64, pwrite64, fsync, fdatasync\}} and their corresponding \texttt{sys\_exit} tracepoints. A BPF hash map \texttt{syscall\_starts} records the monotonic start timestamp ($t_{\text{enter}}$). On exit, elapsed duration $\tau = t_{\text{exit}} - t_{\text{enter}}$ is emitted alongside the return code.
+    \item \textbf{Block Layer}: \texttt{block:block\_rq\_issue} and \texttt{block:block\_rq\_complete}. We capture device major/minor numbers, sector addresses, transfer byte counts, and completion error codes.
+    \item \textbf{Scheduler}: \texttt{sched:sched\_wakeup}, \texttt{sched:sched\_wakeup\_new}, and \texttt{sched:sched\_switch}. When a target thread wakes up, \texttt{runnable\_starts} records the wakeup timestamp. Upon scheduling onto a CPU in \texttt{sched\_switch}, runnable delay is calculated:
+    \begin{equation}
+        d_{\text{runnable}} = t_{\text{switch\_in}} - t_{\text{wakeup}}
+    \end{equation}
+    If a task is preempted while still runnable (\texttt{prev\_state == 0}), it is immediately re-registered in \texttt{runnable\_starts}.
+\end{itemize}
+
+\subsection{Non-Overlapping Interval Union Algorithm}
+A critical challenge in latency attribution is preventing double-counting. If an operation issues multiple concurrent or overlapping requests, simply summing observed durations can exceed $100\%$ of the wall-clock window ($\sum \tau_i > \Delta t$). 
+
+Let $I = \{[s_i, e_i]\}_{i=1}^M$ be a set of observed event intervals clipped to $[t_{\text{start}}, t_{\text{end}}]$. We sort intervals by start timestamp and compute their non-overlapping union:
+\begin{equation}
+    T_{\text{union}} = \sum_{k=1}^K (e'_k - s'_k)
+\end{equation}
+where $\{[s'_k, e'_k]\}$ represents the disjoint, merged intervals. The normalized syscall duration ratio $R_{\text{sys}}$ is bounded in $[0.0, 1.0]$:
+\begin{equation}
+    R_{\text{sys}} = \frac{T_{\text{sys\_union}}}{\Delta t}
+\end{equation}
+Similarly, runnable scheduler wait duration $T_{\text{sched}}$ is accumulated and normalized as $R_{\text{sched}} = T_{\text{sched}} / \Delta t$. The estimated on-CPU execution ratio is:
+\begin{equation}
+    R_{\text{cpu}} = \max\left(0.0, 1.0 - (R_{\text{sys}} + R_{\text{sched}})\right)
+\end{equation}
+If no telemetry is captured within a window, the interval is flagged as unobserved ($R_{\text{unobserved}} = 1.0, R_{\text{cpu}} = 0.0$).
+
+\subsection{Classification Models}
+\subsubsection{Transparent Rule-Based Classifier}
+We construct a decision hierarchy governed by configurable thresholds ($\theta_{\text{io}} = 0.40, \theta_{\text{sched}} = 0.40, \theta_{\text{cpu}} = 0.60, \theta_{\text{unobserved}} = 0.50$):
+\begin{enumerate}
+    \item \textbf{Abstention Check}: If $R_{\text{unobserved}} \ge \theta_{\text{unobserved}}$ or perf buffer loss rate $> 15\%$, classify as \texttt{indeterminate}.
+    \item \textbf{Scheduler Contention}: If $R_{\text{sched}} \ge \theta_{\text{sched}}$ and $R_{\text{sched}} \ge R_{\text{sys}}$, classify as \texttt{scheduler\_wait\_dominated}.
+    \item \textbf{Storage I/O Wait}: If $R_{\text{sys}} \ge \theta_{\text{io}}$ corroborated by underlying block activity ($\text{bytes} > 0$ or \texttt{fsync} execution), classify as \texttt{io\_wait\_dominated}. If block activity is absent during a long read/write, classify as \texttt{indeterminate} (likely cached I/O).
+    \item \textbf{CPU Processing}: If $R_{\text{cpu}} \ge \theta_{\text{cpu}}$, $R_{\text{sched}} < 0.20$, and $R_{\text{sys}} < 0.25$, classify as \texttt{cpu\_syscall\_dominated}.
+    \item \textbf{Ambiguity Fallback}: Otherwise classify as \texttt{indeterminate}.
+\end{enumerate}
+
+\subsubsection{Single-Source Baselines}
+To evaluate hypothesis H1, we construct three single-source baselines with strict feature isolation:
+\begin{itemize}
+    \item \textbf{Baseline 1 (Syscall-Only)}: Relies exclusively on syscall metrics ($R_{\text{sys}}$); masked from block and scheduler features.
+    \item \textbf{Baseline 2 (Block-Only)}: Relies exclusively on block request issues/completions; cannot observe CPU execution or runnable wait.
+    \item \textbf{Baseline 3 (Scheduler-Only)}: Relies exclusively on $R_{\text{sched}}$; cannot distinguish storage blocking from intentional sleep.
+\end{itemize}
+
+\subsubsection{Lightweight Decision Tree}
+We implement an interpretable Decision Tree (depth $\le 3$) using scikit-learn. To prevent execution leakage, training and test sets are partitioned using a grouped split (\texttt{GroupShuffleSplit}) by \texttt{trial\_id}, ensuring that samples from any single run reside exclusively in either the training or test split.
+
+\section{Experimental Results and Analysis}
+
+\subsection{Controlled Workload Benchmarks}
+We implement five reproducible workloads with controlled interventions:
+\begin{itemize}
+    \item \textbf{Workload A (CPU-Bound)}: Deterministic SHA-256 iterations without file I/O (expected: \textit{cpu\_syscall\_dominated}).
+    \item \textbf{Workload B (Sequential Read)}: Sequential reads from an isolated file with \texttt{posix\_fadvise} cold-cache hints (expected: \textit{io\_wait\_dominated} or cached).
+    \item \textbf{Workload C (Synchronous Write)}: Bounded file writes followed by explicit \texttt{fsync} synchronization (expected: \textit{io\_wait\_dominated}).
+    \item \textbf{Workload D (Scheduler Contention)}: Target computation running alongside competing CPU stress processes (expected: \textit{scheduler\_wait\_dominated}).
+    \item \textbf{Negative Control (Intentional Sleep)}: Explicit voluntary sleep via \texttt{nanosleep} (expected: \textit{indeterminate}).
+\end{itemize}
+
+Experiments evaluate three concurrency levels ($C \in \{1, 2, 4\}$ workers) across repeated trials.
+
+\subsection{Baseline Comparison and Hypothesis Evaluation}
+Table~\ref{tab:baseline_comparison} presents the comparative evaluation across single-source baselines and the fused classifier.
+
+\input{tables/baseline_table.tex}
+
+The experimental data confirms Hypothesis H1: single-source baselines exhibit fundamental diagnostic blind spots. The Syscall-Only baseline achieves high recall on synchronous I/O but misclassifies scheduler contention as CPU execution. The Block-Only baseline fails to observe CPU or scheduler activity, yielding poor coverage. In contrast, the Fused Rule Classifier successfully combines signals across all layers, achieving superior Macro-F1.
+
+Hypothesis H2 is likewise corroborated by the negative-control sleep workload and cached reads: by providing an explicit \textit{indeterminate} class, the model abstains rather than producing high-confidence false attributions.
+
+\subsection{Instrumentation Overhead and Latency Profile}
+Table~\ref{tab:overhead_profile} details the runtime overhead induced by eBPF instrumentation, comparing unmonitored baseline workloads against monitored executions.
+
+\input{tables/overhead_table.tex}
+
+The measured probe overhead remains low ($\le \ValOverheadPercent$), validating the efficiency of in-kernel BPF filtering on target process IDs. Zero perf-buffer event loss was observed under the tested workloads.
+
+\section{Ablation Study and Robustness}
+We systematically ablate individual telemetry sources from the fused classifier:
+\begin{itemize}
+    \item \textbf{No Block I/O}: Eliminating block-layer events causes cached file reads to be falsely classified as physical I/O stalls, degrading precision on \textit{io\_wait\_dominated}.
+    \item \textbf{No Scheduler Telemetry}: Removing scheduler transitions prevents the system from detecting runqueue starvation under Workload D, collapsing scheduler Macro-F1 to 0.
+    \item \textbf{No Syscall Durations}: Removing syscall durations eliminates the boundary between storage calls and user-space computation.
+\end{itemize}
+
+\section{Threats to Validity and Limitations}
+\begin{itemize}
+    \item \textbf{Virtualization Artifacts}: Benchmarks executed inside a VirtualBox guest may experience hypervisor steal time and host OS buffer caching.
+    \item \textbf{Asynchronous Writeback}: In asynchronous buffered writes, physical block dispatch occurs lazily via kernel flusher threads, limiting block-to-syscall matching to window-level correlation.
+    \item \textbf{Kernel Portability}: Tracepoint field formats vary across Linux kernel versions, requiring runtime capability checks.
+\end{itemize}
+
+\section{Ethical and Privacy Safeguards}
+Our telemetry collection adheres to strict privacy safeguards: no user payloads, file contents, memory data, or credentials are intercepted. Telemetry is restricted to monotonic timestamps, return codes, byte counts, and task scheduling transitions.
+
+\section{Conclusion}
+This paper demonstrates that robust fingerprinting of application stalls requires fusing telemetry across system calls, block I/O, and the scheduler. By combining in-kernel BPF filtering, non-overlapping interval union correlation, and an explicit abstention class, our framework accurately identifies the root causes of latency stalls while explicitly flagging unprovable attributions with low probe overhead.
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}

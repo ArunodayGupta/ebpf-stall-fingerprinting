@@ -1,0 +1,42 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Unit test / coverage
+.coverage
+.pytest_cache/
+htmlcov/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Temporary data files (keep directory via .gitkeep)
+data/*
+!data/.gitkeep
+results/*
+!results/.gitkeep
+
+# OS / Editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# LaTeX build artifacts (keep main.tex, references.bib, figures, and generated PDF)
+report/*.aux
+report/*.bbl
+report/*.blg
+report/*.log
+report/*.out
+report/*.toc
+report/*.synctex.gz
+report/*.fdb_latexmk
+report/*.fls

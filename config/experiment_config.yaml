@@ -1,0 +1,89 @@
+# Experiment Configuration for eBPF Application Stall Fingerprinting
+version: "1.0"
+seed: 42
+
+environment:
+  data_dir: "data"
+  results_dir: "results"
+  output_format: "jsonl"
+
+workloads:
+  profiles:
+    quick:
+      concurrency_levels: [1, 2]
+      repetitions: 2
+      cpu_iterations: 500000
+      file_size_mb: 8
+      chunk_size_kb: 64
+      sync_mode: "fsync"
+      sleep_duration_ms: 100
+      contention_worker_count: 2
+    full:
+      concurrency_levels: [1, 2, 4]
+      repetitions: 5
+      cpu_iterations: 2000000
+      file_size_mb: 32
+      chunk_size_kb: 64
+      sync_mode: "fsync"
+      sleep_duration_ms: 200
+      contention_worker_count: 4
+  workload_types:
+    - cpu_bound
+    - file_read_sequential
+    - file_write_sync
+    - scheduler_contention
+    - intentional_sleep_control
+
+collector:
+  perf_buffer_page_cnt: 64
+  poll_timeout_ms: 100
+  buffer_drain_timeout_ms: 1000
+  monitored_syscalls:
+    - read
+    - pread64
+    - write
+    - pwrite64
+    - fsync
+    - fdatasync
+  monitored_sched_events:
+    - sched_wakeup
+    - sched_wakeup_new
+    - sched_switch
+  monitored_block_events:
+    - block_rq_issue
+    - block_rq_complete
+
+correlation:
+  window_margin_ns: 5000000       # 5 ms margin around operation window
+  max_unmatched_drift_ns: 20000000 # 20 ms max clock drift tolerance
+  window_sizes_ms: [50, 100, 200]  # For ablation study on window size
+
+classifier_rules:
+  # Classification thresholds (nanoseconds and ratios)
+  min_stall_duration_ns: 1000000      # 1 millisecond minimum duration to classify as stall
+  io_syscall_ratio_thresh: 0.40       # Sycall duration / wall duration >= 40%
+  io_block_min_bytes: 512             # At least 512 bytes block I/O
+  sched_wait_ratio_thresh: 0.40       # Runnable wait / wall duration >= 40%
+  cpu_on_cpu_ratio_thresh: 0.60       # Measured on-CPU execution >= 60%
+  indeterminate_unobserved_ratio: 0.50 # Unobserved > 50% triggers indeterminate
+  max_dropped_event_rate: 0.15        # >15% dropped events triggers indeterminate
+
+ml_classifier:
+  model_type: "decision_tree"
+  decision_tree_max_depth: 3
+  logistic_regression_c: 1.0
+  train_test_split_ratio: 0.30
+  cv_folds: 4
+  random_state: 42
+
+evaluation:
+  baselines:
+    - syscall_only
+    - block_only
+    - sched_only
+    - fused
+  ablations:
+    - fused_all
+    - no_block
+    - no_sched
+    - no_syscall

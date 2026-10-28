@@ -63,6 +63,11 @@ def run_read_workload(
     # Clean up test file
     cleanup_file(test_file)
 
+    intervention_label = "file_read_cold" if cold_cache else "file_read_warm"
+    # Cold reads that hit storage are expected to be io_wait_dominated; warm cached reads
+    # generate storage syscalls but no underlying block activity and are thus indeterminate/cached.
+    expected_label = "io_wait_dominated" if cold_cache else "indeterminate"
+
     return WorkloadOperationRecord(
         trial_id=trial_id,
         workload_type="file_read_sequential",
@@ -72,13 +77,15 @@ def run_read_workload(
         start_ns=t_start,
         end_ns=t_end,
         duration_ns=duration,
-        intervention_label="file_read_sequential",
-        expected_label="io_wait_dominated",
+        intervention_label=intervention_label,
+        expected_label=expected_label,
         concurrency=concurrency,
         parameters={
             "file_size_mb": file_size_mb,
             "chunk_size_kb": chunk_size_kb,
+            "cold_cache": cold_cache,
             "cold_cache_advised": advised_cold,
+            "cache_state": "cold" if cold_cache else "warm",
             "total_bytes_read": total_read,
         },
     )

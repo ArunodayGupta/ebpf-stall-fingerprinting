@@ -63,16 +63,37 @@ class BPFCollector:
         self.is_active = False
 
     def add_target_pid(self, pid: int):
-        """Dynamically add a PID to the target filter map."""
-        if pid not in self.target_pids:
-            self.target_pids.append(pid)
-        if self.bpf_instance is not None:
-            try:
-                target_map = self.bpf_instance["target_pids"]
-                target_map[ctypes.c_uint32(pid)] = ctypes.c_uint8(1)
-                logger.info(f"Registered PID {pid} in in-kernel filter map.")
-            except Exception as e:
-                logger.warning(f"Failed to add PID {pid} to in-kernel filter map: {e}")
+        """Dynamically add a PID (and its associated task threads) to the target filter map."""
+        pids_to_register = [pid]
+
+        # On Linux, inspect /proc/<pid>/task to discover all existing worker threads
+        if os.name == "posix":
+            task_dir = Path(f"/proc/{pid}/task")
+            if task_dir.exists():
+                try:
+                    for t_entry in task_dir.iterdir():
+                        if t_entry.name.isdigit():
+                            t_tid = int(t_entry.name)
+                            if t_tid not in pids_to_register:
+                                pids_to_register.append(t_tid)
+                except Exception as e:
+                    logger.debug(f"Could not read task dir for PID {pid}: {e}")
+
+        for p in pids_to_register:
+            if p not in self.target_pids:
+                self.target_pids.append(p)
+            if self.bpf_instance is not None:
+                try:
+                    target_map = self.bpf_instance["target_pids"]
+                    target_map[ctypes.c_uint32(p)] = ctypes.c_uint8(1)
+                    logger.info(f"Registered PID/TID {p} in in-kernel filter map.")
+                except Exception as e:
+                    logger.warning(f"Failed to add PID/TID {p} to in-kernel filter map: {e}")
+
+    def add_target_pids(self, pids: List[int]):
+        """Register a list of target PIDs."""
+        for p in pids:
+            self.add_target_pid(p)
 
     def initialize_bpf(self):
         """Compile BPF source and attach probes via BCC."""
@@ -96,7 +117,7 @@ class BPFCollector:
         except Exception as e:
             raise BPFCollectorError(f"Failed to compile/load eBPF program: {e}")
 
-        # Populate target PIDs
+        # Populate initial target PIDs
         target_map = self.bpf_instance["target_pids"]
         for pid in self.target_pids:
             target_map[ctypes.c_uint32(pid)] = ctypes.c_uint8(1)
@@ -151,6 +172,7 @@ class BPFCollector:
                     target_pid=c_event.pid,
                     is_on_cpu=bool(c_event.is_on_cpu),
                     runnable_delay_ns=c_event.runnable_delay_ns,
+                    on_cpu_duration_ns=getattr(c_event, "on_cpu_duration_ns", 0),
                 )
             else:
                 event = BaseEvent(

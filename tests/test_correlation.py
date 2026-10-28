@@ -53,8 +53,10 @@ def test_event_correlator_matching():
         SyscallEvent(event_type=EventType.SYSCALL_COMPLETE.value, timestamp_ns=1600, pid=9999, duration_ns=100),
         # Out-of-window
         SyscallEvent(event_type=EventType.SYSCALL_COMPLETE.value, timestamp_ns=3000, pid=5000, duration_ns=100),
-        # In-window block event
-        BlockEvent(event_type=EventType.BLOCK_RQ_COMPLETE.value, timestamp_ns=1700, bytes_count=4096),
+        # In-window block event matching target PID
+        BlockEvent(event_type=EventType.BLOCK_RQ_COMPLETE.value, timestamp_ns=1700, pid=5000, bytes_count=4096),
+        # In-window block event for unrelated background process
+        BlockEvent(event_type=EventType.BLOCK_RQ_COMPLETE.value, timestamp_ns=1750, pid=9999, bytes_count=8192),
     ]
 
     correlator = EventCorrelator(window_margin_ns=0)
@@ -64,3 +66,5 @@ def test_event_correlator_matching():
     assert cw.syscall_events[0].pid == 5000
     assert len(cw.block_events) == 1
     assert cw.block_events[0].bytes_count == 4096
+    assert len(cw.background_block_events) == 1
+    assert cw.background_block_events[0].bytes_count == 8192

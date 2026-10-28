@@ -133,6 +133,27 @@ def _write_placeholder_tables(tables_dir: Path, macros_file: Path):
     with open(tables_dir / "baseline_table.tex", "w", encoding="utf-8") as f:
         f.write("\n".join(table_lines) + "\n")
 
+    ov_lines = [
+        r"\begin{table}[t]",
+        r"\centering",
+        r"\caption{eBPF Instrumentation Overhead Profile (Awaiting Measured VM Execution)}",
+        r"\label{tab:overhead_profile}",
+        r"\begin{tabular}{lcc}",
+        r"\hline",
+        r"\textbf{Metric} & \textbf{Unmonitored} & \textbf{Monitored (eBPF)} \\",
+        r"\hline",
+        r"Mean Duration (ms) & [Pending Kali] & [Pending Kali] \\",
+        r"Overhead Delta & --- & [Pending Kali] \\",
+        r"p50 Tail Latency & --- & [Pending Kali] \\",
+        r"p99 Tail Latency & --- & [Pending Kali] \\",
+        r"Dropped Event Rate & --- & [Pending Kali] \\",
+        r"\hline",
+        r"\end{tabular}",
+        r"\end{table}",
+    ]
+    with open(tables_dir / "overhead_table.tex", "w", encoding="utf-8") as f:
+        f.write("\n".join(ov_lines) + "\n")
+
     macros = [
         r"\newcommand{\ValFusedMacroF1}{[Pending Execution]}",
         r"\newcommand{\ValFusedAccuracy}{[Pending Execution]}",

@@ -94,7 +94,7 @@ def run_smoke_test():
     print(f"      Syscall Ratio: {features['syscall_duration_ratio']}, On-CPU Ratio: {features['on_cpu_ratio']}")
 
     # Step 5: Test Rule Classification
-    print("[5/5] Testing rule-based classifier...")
+    print("[5/6] Testing rule-based classifier...")
     classifier = RuleBasedClassifier()
     pred = classifier.predict_sample(features)
     print(f"      Prediction: {pred.predicted_label}")
@@ -102,8 +102,52 @@ def run_smoke_test():
     print(f"      Rule Fired: {pred.rule_fired}")
     print(f"      Explanation: {pred.explanation}")
 
+    # Step 6: Live eBPF Attachment & Kernel Emission Test (on Linux with root)
+    print("[6/6] Checking live kernel eBPF probe attachment...")
+    can_trace_live = False
+    try:
+        import bcc
+        if os.name == "posix" and os.geteuid() == 0:
+            can_trace_live = True
+    except ImportError:
+        pass
+
+    if can_trace_live:
+        print("      Environment has BCC and root privileges. Testing live eBPF probe attachment...")
+        from stall_fingerprint.collector import BPFCollector
+        live_events_file = smoke_dir / "live_smoke_events.jsonl"
+        my_pid = os.getpid()
+        collector = BPFCollector(output_path=live_events_file, target_pids=[my_pid])
+        try:
+            collector.start()
+            print(f"      eBPF probes attached. Target PID registered: {my_pid}")
+            # Generate controlled syscalls in target process
+            test_tmp = smoke_dir / "live_probe_trigger.tmp"
+            with open(test_tmp, "w") as f:
+                f.write("ebpf live tracepoint verification\n")
+            with open(test_tmp, "r") as f:
+                _ = f.read()
+            if test_tmp.exists():
+                test_tmp.unlink()
+
+            time.sleep(0.15)  # Allow perf buffer poll to drain
+            collector.stop()
+
+            live_reader = EventReader(live_events_file)
+            live_events = live_reader.read_all()
+            print(f"      Live probe capture succeeded: {len(live_events)} events emitted from kernel.")
+            has_target = any(getattr(e, "pid", 0) == my_pid for e in live_events)
+            assert has_target, f"Expected events for registered PID {my_pid} in perf buffer."
+            print("      Live eBPF target registration and event emission VERIFIED.")
+        except Exception as e:
+            print(f"      ERROR in live eBPF attachment: {e}")
+            raise
+    else:
+        print("      Host environment does not support real eBPF kernel tracing (requires Linux EUID 0 + BCC).")
+        print("      Live kernel probe test skipped; user-space schema, pipeline, and rules verified.")
+
     print("=" * 60)
-    print("  SMOKE TEST PASSED: All core pipeline stages verified!")
+    print("  SMOKE TEST PASSED: All verified pipeline stages succeeded!")
     print("=" * 60)
 
 if __name__ == "__main__":

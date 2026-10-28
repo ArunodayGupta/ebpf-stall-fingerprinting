@@ -68,13 +68,17 @@ class LightweightMLClassifier:
         self,
         df: pd.DataFrame,
         test_size: float = 0.30,
-        group_col: str = "trial_id",
+        group_col: Optional[str] = None,
         target_col: str = "expected_label",
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
-        Grouped split guaranteeing all samples from a trial reside strictly in either train or test.
+        Grouped split guaranteeing all samples from a parent trial run reside strictly in either train or test.
         """
-        groups = df[group_col].values
+        col = group_col
+        if col is None:
+            col = "parent_trial_id" if "parent_trial_id" in df.columns else "trial_id"
+
+        groups = df[col].values
         gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=self.random_state)
         train_idx, test_idx = next(gss.split(df, groups=groups))
 
@@ -110,6 +114,15 @@ class LightweightMLClassifier:
 
         X = df[self.feature_names].fillna(0.0).values
         return list(self.model.predict(X))
+
+    def evaluate_held_out(self, test_df: pd.DataFrame, target_col: str = "expected_label") -> Dict[str, Any]:
+        """Evaluates model strictly on held-out test data."""
+        from stall_fingerprint.evaluation import compute_classification_metrics
+        if test_df.empty or not self.is_fitted:
+            return compute_classification_metrics([], [])
+        y_true = test_df[target_col].tolist()
+        y_pred = self.predict(test_df)
+        return compute_classification_metrics(y_true, y_pred)
 
     def get_feature_importances(self) -> Dict[str, float]:
         if not self.is_fitted or self.model is None:

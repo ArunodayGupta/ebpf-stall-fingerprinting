@@ -23,7 +23,15 @@ class WorkloadOperationRecord:
     intervention_label: str
     expected_label: str
     concurrency: int = 1
+    parent_trial_id: str = ""
     parameters: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        if not self.parent_trial_id:
+            if "_worker_" in self.trial_id:
+                self.parent_trial_id = self.trial_id.split("_worker_")[0]
+            else:
+                self.parent_trial_id = self.trial_id
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

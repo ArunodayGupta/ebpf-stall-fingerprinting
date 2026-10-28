@@ -59,24 +59,62 @@ class RuleBasedClassifier:
         sched_wait_ratio = features.get("sched_wait_ratio", 0.0)
         on_cpu_ratio = features.get("on_cpu_ratio", 0.0)
         unobserved_ratio = features.get("unobserved_ratio", 0.0)
-        has_block = features.get("has_block_activity", 0)
-        block_bytes = features.get("block_total_bytes", 0)
+        off_cpu_blocked_ratio = features.get("off_cpu_blocked_ratio", 0.0)
+        sleep_syscall_ratio = features.get("sleep_syscall_ratio", 0.0)
+
+        has_target_block = features.get("has_target_block_activity", features.get("has_block_activity", 0))
+        target_bytes = features.get("target_block_bytes", features.get("block_total_bytes", 0))
+        has_bg_block = features.get("has_background_block_activity", 0)
+        bg_bytes = features.get("background_block_bytes", 0)
+
         fsync_cnt = features.get("fsync_count", 0)
         dropped_cnt = features.get("dropped_event_count", 0)
+        dropped_rate = features.get("dropped_event_rate", 0.0)
         is_empty = features.get("is_empty_window", 0)
-        workload_type = features.get("workload_type", "")
 
         contributing = {
             "wall_duration_ms": round(wall_ns / 1_000_000, 2),
             "syscall_ratio": syscall_ratio,
             "sched_wait_ratio": sched_wait_ratio,
             "on_cpu_ratio": on_cpu_ratio,
+            "off_cpu_blocked_ratio": off_cpu_blocked_ratio,
+            "sleep_syscall_ratio": sleep_syscall_ratio,
             "unobserved_ratio": unobserved_ratio,
-            "has_block": has_block,
+            "has_target_block": has_target_block,
+            "target_bytes": target_bytes,
+            "has_bg_block": has_bg_block,
             "fsync_count": fsync_cnt,
+            "dropped_event_rate": dropped_rate,
         }
 
-        # Rule 0: Telemetry Loss or Empty Window Abstention
+        # Rule 0a: Excessive Telemetry Drop Rate Abstention
+        if dropped_rate >= self.max_dropped_event_rate:
+            return RulePrediction(
+                predicted_label=LABEL_INDETERMINATE,
+                confidence=0.95,
+                rule_fired="RULE_ABSTAIN_EXCESSIVE_DROPS",
+                contributing_signals=contributing,
+                explanation=(
+                    f"Excessive telemetry event loss ({dropped_rate:.2%}) exceeds reliable attribution "
+                    f"threshold ({self.max_dropped_event_rate:.2%}). Result marked indeterminate."
+                ),
+            )
+
+        # Rule 0b: Voluntary Sleep / Negative-Control Abstention
+        max_sleep_signal = max(off_cpu_blocked_ratio, sleep_syscall_ratio)
+        if max_sleep_signal >= 0.40:
+            return RulePrediction(
+                predicted_label=LABEL_INDETERMINATE,
+                confidence=0.95,
+                rule_fired="RULE_OFF_CPU_VOLUNTARY_SLEEP",
+                contributing_signals=contributing,
+                explanation=(
+                    f"Task spent dominant time voluntarily blocked off-CPU ({max_sleep_signal:.2f}), "
+                    "not runnable or stalled on storage. Validated negative control (abstention)."
+                ),
+            )
+
+        # Rule 0c: Empty Window or Dominant Unobserved Gap Abstention
         if is_empty == 1 or unobserved_ratio >= self.indeterminate_unobserved:
             return RulePrediction(
                 predicted_label=LABEL_INDETERMINATE,
@@ -104,9 +142,9 @@ class RuleBasedClassifier:
                 ),
             )
 
-        # Rule 2: I/O Wait Dominance (Syscall duration + Block layer corroboration or sync calls)
+        # Rule 2: I/O Wait Dominance (Syscall duration + Target-attributed Block layer corroboration or sync calls)
         if syscall_ratio >= self.io_syscall_ratio_thresh:
-            if has_block or fsync_cnt > 0 or block_bytes >= self.io_block_min_bytes:
+            if has_target_block or fsync_cnt > 0 or target_bytes >= self.io_block_min_bytes:
                 conf = min(0.60 + syscall_ratio / 2.5, 0.99)
                 return RulePrediction(
                     predicted_label=LABEL_IO_WAIT,
@@ -115,11 +153,24 @@ class RuleBasedClassifier:
                     contributing_signals=contributing,
                     explanation=(
                         f"Long storage syscall duration (ratio: {syscall_ratio:.2f} >= {self.io_syscall_ratio_thresh:.2f}) "
-                        f"corroborated by block I/O activity ({block_bytes} bytes, fsync={fsync_cnt})."
+                        f"corroborated by target block I/O activity ({target_bytes} bytes, fsync={fsync_cnt})."
+                    ),
+                )
+            elif has_bg_block > 0:
+                # Concurrent background block activity present, but NOT attributable to target process
+                return RulePrediction(
+                    predicted_label=LABEL_INDETERMINATE,
+                    confidence=0.75,
+                    rule_fired="RULE_IO_AMBIGUOUS_UNATTRIBUTED_BLOCK",
+                    contributing_signals=contributing,
+                    explanation=(
+                        f"Syscall duration was elevated ({syscall_ratio:.2f}) with concurrent system block activity "
+                        f"({bg_bytes} bytes), but no block requests were attributable to the target PID. "
+                        "Preserving uncertainty under cross-process background activity."
                     ),
                 )
             else:
-                # Long syscall without block I/O activity: could be cached I/O or indeterminate
+                # Long syscall without block I/O activity: cached I/O
                 return RulePrediction(
                     predicted_label=LABEL_INDETERMINATE,
                     confidence=0.65,
@@ -132,7 +183,13 @@ class RuleBasedClassifier:
                 )
 
         # Rule 3: CPU/Syscall Processing Dominance
-        if on_cpu_ratio >= self.cpu_on_cpu_ratio_thresh and sched_wait_ratio < 0.20 and syscall_ratio < 0.25:
+        if (
+            on_cpu_ratio >= self.cpu_on_cpu_ratio_thresh
+            and sched_wait_ratio < 0.20
+            and syscall_ratio < 0.25
+            and off_cpu_blocked_ratio < 0.20
+            and sleep_syscall_ratio < 0.10
+        ):
             conf = min(0.65 + on_cpu_ratio / 3.0, 0.99)
             return RulePrediction(
                 predicted_label=LABEL_CPU_SYSCALL,

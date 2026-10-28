@@ -39,22 +39,52 @@ struct kernel_event_t {
     char rwbs[8];
     s32 error;
 
+struct kernel_event_t {
+    u32 event_type;
+    u64 timestamp_ns;
+    u32 pid;
+    u32 tid;
+    char comm[16];
+
+    // Syscall fields
+    u32 syscall_id;
+    u64 duration_ns;
+    s64 ret;
+
+    // Block fields
+    u32 dev;
+    u64 sector;
+    u32 nr_sector;
+    u32 bytes_count;
+    char rwbs[8];
+    s32 error;
+
     // Sched fields
     u32 prev_pid;
     u32 next_pid;
     s64 prev_state;
     u8 is_on_cpu;
     u64 runnable_delay_ns;
+    u64 on_cpu_duration_ns;
 };
 
-// Target PIDs filter map: key = PID (tgid), val = 1
-BPF_HASH(target_pids, u32, u8, 1024);
+// Target PIDs filter map: key = PID/TID, val = 1
+BPF_HASH(target_pids, u32, u8, 2048);
 
-// Syscall start tracking map: key = tgid, val = start_timestamp_ns
-BPF_HASH(syscall_starts, u64, u64, 4096);
+// Syscall start tracking map: key = ((u64)tid << 32) | syscall_id, val = start_timestamp_ns
+BPF_HASH(syscall_starts, u64, u64, 8192);
 
 // Scheduler runnable start tracking: key = pid, val = wakeup_timestamp_ns
 BPF_HASH(runnable_starts, u32, u64, 4096);
+
+// On-CPU start tracking: key = pid, val = on_cpu_timestamp_ns
+BPF_HASH(on_cpu_starts, u32, u64, 4096);
+
+// Off-CPU blocked start tracking: key = pid, val = blocked_timestamp_ns
+BPF_HASH(blocked_starts, u32, u64, 4096);
+
+// In-flight block request attribution map: key = ((u64)dev << 32) | sector, val = submitting tgid
+BPF_HASH(inflight_rq, u64, u32, 8192);
 
 // Perf output ring buffer
 BPF_PERF_OUTPUT(events);
@@ -70,13 +100,15 @@ static inline u8 is_target_pid(u32 pid) {
 static inline void record_syscall_enter(void *ctx, u32 syscall_id) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 tgid = pid_tgid >> 32;
+    u32 tid = (u32)pid_tgid;
 
-    if (!is_target_pid(tgid)) {
+    if (!is_target_pid(tgid) && !is_target_pid(tid)) {
         return;
     }
 
     u64 now = bpf_ktime_get_ns();
-    u64 key = ((u64)tgid << 32) | (u64)syscall_id;
+    // Key by thread ID (tid) and syscall_id to eliminate thread collisions
+    u64 key = ((u64)tid << 32) | (u64)syscall_id;
     syscall_starts.update(&key, &now);
 }
 
@@ -85,11 +117,11 @@ static inline void record_syscall_exit(void *ctx, u32 syscall_id, s64 ret) {
     u32 tgid = pid_tgid >> 32;
     u32 tid = (u32)pid_tgid;
 
-    if (!is_target_pid(tgid)) {
+    if (!is_target_pid(tgid) && !is_target_pid(tid)) {
         return;
     }
 
-    u64 key = ((u64)tgid << 32) | (u64)syscall_id;
+    u64 key = ((u64)tid << 32) | (u64)syscall_id;
     u64 *start_ns = syscall_starts.lookup(&key);
     if (!start_ns) {
         return;
@@ -112,7 +144,7 @@ static inline void record_syscall_exit(void *ctx, u32 syscall_id, s64 ret) {
     events.perf_submit(ctx, &ev, sizeof(ev));
 }
 
-// Tracepoints for syscalls: sys_enter_* and sys_exit_*
+// Tracepoints for storage syscalls: sys_enter_* and sys_exit_*
 TRACEPOINT_PROBE(syscalls, sys_enter_read) {
     record_syscall_enter(args, 0);
     return 0;
@@ -167,12 +199,34 @@ TRACEPOINT_PROBE(syscalls, sys_exit_fdatasync) {
     return 0;
 }
 
+// Tracepoints for voluntary sleep syscalls (negative-control tracing)
+TRACEPOINT_PROBE(syscalls, sys_enter_nanosleep) {
+    record_syscall_enter(args, 35);
+    return 0;
+}
+TRACEPOINT_PROBE(syscalls, sys_exit_nanosleep) {
+    record_syscall_exit(args, 35, args->ret);
+    return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_enter_clock_nanosleep) {
+    record_syscall_enter(args, 230);
+    return 0;
+}
+TRACEPOINT_PROBE(syscalls, sys_exit_clock_nanosleep) {
+    record_syscall_exit(args, 230, args->ret);
+    return 0;
+}
+
 // -------------------------------------------------------------
-// Block Layer Tracing
+// Block Layer Tracing with In-Flight Request Attribution
 // -------------------------------------------------------------
 TRACEPOINT_PROBE(block, block_rq_issue) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 tgid = pid_tgid >> 32;
+
+    u64 rq_key = ((u64)args->dev << 32) | (u32)(args->sector & 0xFFFFFFFF);
+    inflight_rq.update(&rq_key, &tgid);
 
     struct kernel_event_t ev = {};
     ev.event_type = EV_BLOCK_RQ_ISSUE;
@@ -194,6 +248,14 @@ TRACEPOINT_PROBE(block, block_rq_complete) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 tgid = pid_tgid >> 32;
 
+    // Associate completing request with original submitting PID
+    u64 rq_key = ((u64)args->dev << 32) | (u32)(args->sector & 0xFFFFFFFF);
+    u32 *submitting_tgid = inflight_rq.lookup(&rq_key);
+    if (submitting_tgid) {
+        tgid = *submitting_tgid;
+        inflight_rq.delete(&rq_key);
+    }
+
     struct kernel_event_t ev = {};
     ev.event_type = EV_BLOCK_RQ_COMPLETE;
     ev.timestamp_ns = bpf_ktime_get_ns();
@@ -202,6 +264,7 @@ TRACEPOINT_PROBE(block, block_rq_complete) {
     ev.dev = args->dev;
     ev.sector = args->sector;
     ev.nr_sector = args->nr_sector;
+    ev.bytes_count = args->nr_sector * 512;
     ev.error = args->error;
     bpf_probe_read_kernel_str(&ev.rwbs, sizeof(ev.rwbs), args->rwbs);
     bpf_get_current_comm(&ev.comm, sizeof(ev.comm));
@@ -211,7 +274,7 @@ TRACEPOINT_PROBE(block, block_rq_complete) {
 }
 
 // -------------------------------------------------------------
-// Scheduler Tracing
+// Scheduler Tracing with Actual On-CPU and Off-CPU Accounting
 // -------------------------------------------------------------
 static inline void handle_wakeup(void *ctx, u32 pid) {
     if (!is_target_pid(pid)) {
@@ -252,6 +315,9 @@ TRACEPOINT_PROBE(sched, sched_switch) {
             runnable_starts.delete(&next_pid);
         }
 
+        // Track when this task started executing on CPU
+        on_cpu_starts.update(&next_pid, &now);
+
         struct kernel_event_t ev = {};
         ev.event_type = EV_SCHED_SWITCH;
         ev.timestamp_ns = now;
@@ -261,14 +327,25 @@ TRACEPOINT_PROBE(sched, sched_switch) {
         ev.prev_state = args->prev_state;
         ev.is_on_cpu = 1;
         ev.runnable_delay_ns = runnable_delay;
+        ev.on_cpu_duration_ns = 0;
         events.perf_submit(args, &ev, sizeof(ev));
     }
 
     // 2. Previous task scheduled off CPU
     if (is_target_pid(prev_pid)) {
+        u64 on_cpu_dur = 0;
+        u64 *on_start = on_cpu_starts.lookup(&prev_pid);
+        if (on_start) {
+            on_cpu_dur = now - *on_start;
+            on_cpu_starts.delete(&prev_pid);
+        }
+
         // If state is 0 (TASK_RUNNING), it was preempted and remains runnable
         if (args->prev_state == 0) {
             runnable_starts.update(&prev_pid, &now);
+        } else {
+            // Task blocked voluntarily off-CPU (sleep, lock, or wait)
+            blocked_starts.update(&prev_pid, &now);
         }
 
         struct kernel_event_t ev = {};
@@ -280,6 +357,7 @@ TRACEPOINT_PROBE(sched, sched_switch) {
         ev.prev_state = args->prev_state;
         ev.is_on_cpu = 0;
         ev.runnable_delay_ns = 0;
+        ev.on_cpu_duration_ns = on_cpu_dur;
         events.perf_submit(args, &ev, sizeof(ev));
     }
 
@@ -308,6 +386,7 @@ class KernelEventCStruct(ctypes.Structure):
         ("prev_state", ctypes.c_int64),
         ("is_on_cpu", ctypes.c_uint8),
         ("runnable_delay_ns", ctypes.c_uint64),
+        ("on_cpu_duration_ns", ctypes.c_uint64),
     ]
 
 SYSCALL_ID_TO_NAME = {
@@ -315,6 +394,8 @@ SYSCALL_ID_TO_NAME = {
     1: "write",
     17: "pread64",
     18: "pwrite64",
+    35: "nanosleep",
     74: "fsync",
     75: "fdatasync",
+    230: "clock_nanosleep",
 }

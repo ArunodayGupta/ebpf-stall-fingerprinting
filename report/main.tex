@@ -159,16 +159,16 @@ Table~\ref{tab:baseline_comparison} presents the comparative evaluation across s
 
 \input{tables/baseline_table.tex}
 
-The experimental data confirms Hypothesis H1: single-source baselines exhibit fundamental diagnostic blind spots. The Syscall-Only baseline achieves high recall on synchronous I/O but misclassifies scheduler contention as CPU execution. The Block-Only baseline fails to observe CPU or scheduler activity, yielding poor coverage. In contrast, the Fused Rule Classifier successfully combines signals across all layers, achieving superior Macro-F1.
+The experimental protocol is designed to test Hypothesis H1 and H2 across the controlled workload matrix. Preliminary pipeline tests indicate that single-source baselines exhibit fundamental diagnostic blind spots: the Syscall-Only baseline cannot distinguish off-CPU scheduler contention from CPU execution, while the Block-Only baseline fails to observe CPU or scheduler activity. In contrast, the Fused Rule Classifier combines signals across all layers to provide unified attribution.
 
-Hypothesis H2 is likewise corroborated by the negative-control sleep workload and cached reads: by providing an explicit \textit{indeterminate} class, the model abstains rather than producing high-confidence false attributions.
+Hypothesis H2 is tested by evaluating the negative-control sleep workload and cached reads: by providing an explicit \textit{indeterminate} class, the model abstains rather than producing high-confidence false attributions. Final quantitative metrics for the target Kali Linux environment will be populated directly upon execution via \texttt{generate\_report\_data.py}.
 
 \subsection{Instrumentation Overhead and Latency Profile}
 Table~\ref{tab:overhead_profile} details the runtime overhead induced by eBPF instrumentation, comparing unmonitored baseline workloads against monitored executions.
 
 \input{tables/overhead_table.tex}
 
-The measured probe overhead remains low ($\le \ValOverheadPercent$), validating the efficiency of in-kernel BPF filtering on target process IDs. Zero perf-buffer event loss was observed under the tested workloads.
+The measurement harness computes like-for-like overhead across identical workload conditions. In-kernel filtering via the \texttt{target\_pids} map ensures that unmonitored system activity incurs minimal probe evaluation overhead. Buffer overflow diagnostics and lost event callbacks are tracked to ensure that any trial exceeding the configured drop threshold is flagged as indeterminate.
 
 \section{Ablation Study and Robustness}
 We systematically ablate individual telemetry sources from the fused classifier:

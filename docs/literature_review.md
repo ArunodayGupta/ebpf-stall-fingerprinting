@@ -25,7 +25,7 @@ This literature survey contextualizes the research problem: distinguishing wheth
 ### B. eBPF Memory and Execution Efficiency
 * **Liu, Tak, & Wang, "Understanding Performance of eBPF Maps" (ACM eBPF '24)** [DOI: `10.1145/3672197.3673430`]  
   * *Problem:* Hash maps in eBPF can introduce lookup latency and cache eviction penalties when improperly dimensioned.
-  * *Motivation for our Design:* Informs the hash table capacity for `syscall_starts` (4096 entries) and `runnable_starts` (4096 entries) to guarantee $O(1)$ constant-time lookup and zero hash bucket collision overhead.
+  * *Motivation for our Design:* Informs the hash table sizing for `syscall_starts` (8192 entries) and `runnable_starts` (4096 entries) to minimize hash collisions, prevent map entry drops, and maintain near $O(1)$ amortized lookup latency under expected peak concurrency.
 
 * **Mao et al., "Merlin: Multi-tier Optimization of eBPF Code for Performance and Compactness" (ASPLOS '24)** [DOI: `10.1145/3620666.3651387`]  
   * *Key Finding:* Compact BPF bytecode reduces verifier complexity and runtime latency.

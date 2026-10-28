@@ -12,8 +12,8 @@ import os
 import sys
 import time
 import logging
-from typing import List, Dict, Any, Optional
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
+from typing import List, Dict, Any, Optional, Callable
 from workloads.workload_utils import WorkloadOperationRecord
 from workloads.cpu_workload import run_cpu_workload
 from workloads.read_workload import run_read_workload
@@ -53,9 +53,31 @@ def _dispatch_single_workload(
     else:
         raise ValueError(f"Unknown workload type: {workload_type}")
 
+def _worker_process_entry(
+    workload_type: str,
+    worker_trial_id: str,
+    parent_trial_id: str,
+    concurrency: int,
+    params: Dict[str, Any],
+    ready_queue: Any,
+    start_event: Any,
+    result_queue: Any,
+):
+    """Worker entry point enforcing registration before beginning timed execution."""
+    try:
+        pid = os.getpid()
+        ready_queue.put(pid)
+        # Block until supervisor has registered PID in kernel BPF map
+        start_event.wait()
+        rec = _dispatch_single_workload(workload_type, worker_trial_id, concurrency, params)
+        rec.parent_trial_id = parent_trial_id
+        result_queue.put((True, rec))
+    except Exception as e:
+        result_queue.put((False, str(e)))
+
 class WorkloadSupervisor:
     """
-    Coordinates multi-concurrency workload executions.
+    Coordinates multi-concurrency workload executions with pre-execution PID registration.
     """
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -67,24 +89,61 @@ class WorkloadSupervisor:
         trial_id: str,
         concurrency: int = 1,
         params: Optional[Dict[str, Any]] = None,
+        register_pid_fn: Optional[Callable[[int], None]] = None,
     ) -> List[WorkloadOperationRecord]:
-        p = params or {}
+        p_params = params or {}
         records: List[WorkloadOperationRecord] = []
 
         if concurrency == 1:
-            rec = _dispatch_single_workload(workload_type, trial_id, concurrency, p)
+            if register_pid_fn:
+                register_pid_fn(os.getpid())
+            rec = _dispatch_single_workload(workload_type, trial_id, concurrency, p_params)
+            rec.parent_trial_id = trial_id
             records.append(rec)
         else:
-            with ProcessPoolExecutor(max_workers=concurrency) as executor:
-                futures = [
-                    executor.submit(_dispatch_single_workload, workload_type, f"{trial_id}_worker_{i}", concurrency, p)
-                    for i in range(concurrency)
-                ]
-                for fut in as_completed(futures):
-                    try:
-                        records.append(fut.result())
-                    except Exception as e:
-                        logger.error(f"Concurrent worker execution failed: {e}")
-                        raise
+            ready_queue = mp.Queue()
+            start_event = mp.Event()
+            result_queue = mp.Queue()
+            procs = []
+
+            for i in range(concurrency):
+                worker_trial_id = f"{trial_id}_worker_{i}"
+                p = mp.Process(
+                    target=_worker_process_entry,
+                    args=(
+                        workload_type,
+                        worker_trial_id,
+                        trial_id,
+                        concurrency,
+                        p_params,
+                        ready_queue,
+                        start_event,
+                        result_queue,
+                    ),
+                    daemon=False,
+                )
+                p.start()
+                procs.append(p)
+
+            # Wait for all workers to spawn and report their PIDs
+            worker_pids = []
+            for _ in range(concurrency):
+                w_pid = ready_queue.get(timeout=15.0)
+                worker_pids.append(w_pid)
+                if register_pid_fn:
+                    register_pid_fn(w_pid)
+
+            # Release startup barrier: all processes start timed work simultaneously
+            start_event.set()
+
+            for _ in range(concurrency):
+                success, val = result_queue.get(timeout=120.0)
+                if success:
+                    records.append(val)
+                else:
+                    raise RuntimeError(f"Concurrent worker execution failed: {val}")
+
+            for p in procs:
+                p.join(timeout=5.0)
 
         return records

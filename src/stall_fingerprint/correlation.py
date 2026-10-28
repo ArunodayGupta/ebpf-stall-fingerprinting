@@ -27,7 +27,8 @@ from workloads.workload_utils import WorkloadOperationRecord
 class WindowCorrelatedEvents:
     operation: WorkloadOperationRecord
     syscall_events: List[SyscallEvent] = field(default_factory=list)
-    block_events: List[BlockEvent] = field(default_factory=list)
+    block_events: List[BlockEvent] = field(default_factory=list)              # Target-attributed block events
+    background_block_events: List[BlockEvent] = field(default_factory=list)   # Unrelated / concurrent background block events
     sched_events: List[SchedEvent] = field(default_factory=list)
     dropped_events_count: int = 0
     diagnostic_count: int = 0
@@ -66,11 +67,13 @@ def compute_interval_union(intervals: List[Tuple[int, int]], clip_min: int, clip
 
 class EventCorrelator:
     """
-    Correlates a stream of raw events with workload operation records.
+    Correlates a stream of raw events with workload operation records,
+    strictly distinguishing target-associated evidence from background system context.
     """
 
-    def __init__(self, window_margin_ns: int = 0):
+    def __init__(self, window_margin_ns: int = 0, attribution_mode: str = "attributed"):
         self.window_margin_ns = window_margin_ns
+        self.attribution_mode = attribution_mode  # "attributed" (default) or "all_window" (for ablation)
 
     def correlate_operation(
         self,
@@ -78,6 +81,7 @@ class EventCorrelator:
         events: List[BaseEvent],
     ) -> WindowCorrelatedEvents:
         target_pid = op.pid
+        target_tid = getattr(op, "tid", target_pid)
         win_start = op.start_ns - self.window_margin_ns
         win_end = op.end_ns + self.window_margin_ns
 
@@ -90,18 +94,34 @@ class EventCorrelator:
                 continue
 
             if isinstance(ev, SyscallEvent):
-                # Match by PID
-                if ev.pid == target_pid or ev.tid == target_pid or target_pid == 0:
+                # Match by PID or TID
+                if ev.pid == target_pid or ev.tid == target_pid or ev.tid == target_tid or target_pid == 0:
                     matched.syscall_events.append(ev)
             elif isinstance(ev, BlockEvent):
-                # Block events are window-associated (and PID matched if available)
-                if ev.pid == target_pid or ev.pid == 0:
+                # Distinguish target-associated block I/O from background activity
+                is_target = (
+                    (ev.pid == target_pid) or
+                    (target_tid != 0 and ev.pid == target_tid) or
+                    (target_pid == 0)
+                )
+
+                if self.attribution_mode == "all_window":
+                    # Ablation mode: treat any block event in window as target evidence
                     matched.block_events.append(ev)
                 else:
-                    # Keep track of concurrent block activity in window as context
-                    matched.block_events.append(ev)
+                    if is_target:
+                        matched.block_events.append(ev)
+                    else:
+                        matched.background_block_events.append(ev)
             elif isinstance(ev, SchedEvent):
-                if ev.target_pid == target_pid or ev.next_pid == target_pid or ev.prev_pid == target_pid:
+                is_sched_target = (
+                    ev.target_pid == target_pid or
+                    ev.next_pid == target_pid or
+                    ev.prev_pid == target_pid or
+                    (target_tid != 0 and (ev.target_pid == target_tid or ev.next_pid == target_tid or ev.prev_pid == target_tid)) or
+                    target_pid == 0
+                )
+                if is_sched_target:
                     matched.sched_events.append(ev)
             elif ev.event_type == EventType.DROPPED_EVENT_STATS.value:
                 matched.dropped_events_count += getattr(ev, "total_events_lost", 0)

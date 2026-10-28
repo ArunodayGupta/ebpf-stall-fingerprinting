@@ -141,6 +141,7 @@ def run_experiment_matrix(
                     trial_id=trial_id,
                     concurrency=1,
                     params=profile,
+                    register_pid_fn=None,
                 )
                 for r in recs:
                     unmonitored_durations_map[w_type].append(r.duration_ns / 1_000_000)
@@ -149,6 +150,8 @@ def run_experiment_matrix(
 
     # 2. Measure Monitored Workloads with eBPF Tracing
     logger.info("--- Phase 2: Executing Monitored Tracing Workloads ---")
+    total_dropped_events = 0
+
     with EventWriter(raw_events_path) as event_writer:
         for w_type in workload_types:
             for conc in concurrency_levels:
@@ -166,25 +169,34 @@ def run_experiment_matrix(
                             collector.start()
                         except Exception as e:
                             logger.error(f"BPF Collector failed to start: {e}")
+                            if not allow_synthetic:
+                                raise RuntimeError(
+                                    f"CRITICAL: Failed to initialize eBPF collector for {trial_id}: {e}. "
+                                    "Failing closed to prevent uninstrumented runs masquerading as monitored data."
+                                )
                             collector = None
 
-                    # Execute workload
-                    t0 = time.monotonic_ns()
+                    # Execute workload with target PID registration coordination
+                    reg_fn = collector.add_target_pid if collector is not None else None
                     try:
                         recs = supervisor.execute_workload_trial(
                             workload_type=w_type,
                             trial_id=trial_id,
                             concurrency=conc,
                             params=profile,
+                            register_pid_fn=reg_fn,
                         )
-                        t1 = time.monotonic_ns()
-                        wall_ms = (t1 - t0) / 1_000_000
-                        monitored_durations_map[w_type].append(wall_ms)
+                        # Record inner workload duration for honest, like-for-like comparison
+                        for r in recs:
+                            monitored_durations_map[w_type].append(r.duration_ns / 1_000_000)
                         all_op_records.extend(recs)
                     except Exception as e:
                         logger.error(f"Workload {trial_id} failed: {e}")
+                        if not allow_synthetic:
+                            raise
                     finally:
                         if collector is not None:
+                            total_dropped_events += collector.total_events_lost
                             collector.stop()
 
     # Save workload operations metadata table
@@ -197,6 +209,11 @@ def run_experiment_matrix(
     event_reader = EventReader(raw_events_path)
     all_events = event_reader.read_all()
     logger.info(f"Total raw events loaded: {len(all_events)}")
+
+    # Incorporate any dropped event records from event stream
+    for ev in all_events:
+        if ev.event_type == EventType.DROPPED_EVENT_STATS.value:
+            total_dropped_events = max(total_dropped_events, getattr(ev, "total_events_lost", 0))
 
     correlated_windows = correlator.correlate_all(all_op_records, all_events)
 
@@ -223,15 +240,30 @@ def run_experiment_matrix(
     features_df["pred_baseline_block"] = base_block.predict_dataframe(features_df)
     features_df["pred_baseline_sched"] = base_sched.predict_dataframe(features_df)
 
-    # 7. Evaluate Lightweight ML Classifier
-    logger.info("--- Phase 7: Training & Evaluating Lightweight ML Classifier ---")
+    # 7. Evaluate Lightweight ML Classifier (Strictly on Held-Out Test Split)
+    logger.info("--- Phase 7: Training & Evaluating Lightweight ML Classifier on Held-Out Test Split ---")
     ml_classifier = LightweightMLClassifier(max_depth=3, random_state=42)
     ml_fitted = False
+    ml_test_metrics = None
+    ml_train_diagnostics = None
+
     if not features_df.empty:
-        train_df, test_df = ml_classifier.split_data_by_trial(features_df, test_size=0.30)
+        train_df, test_df = ml_classifier.split_data_by_trial(features_df, test_size=0.30, group_col="parent_trial_id")
         ml_fitted = ml_classifier.fit(train_df, target_col="expected_label")
         if ml_fitted:
+            # Predict for full table for record-keeping
             features_df["pred_ml_tree"] = ml_classifier.predict(features_df)
+
+            # Calculate primary headline ML metrics STRICTLY on held-out test split
+            test_preds = ml_classifier.predict(test_df)
+            test_df["pred_ml_tree"] = test_preds
+            test_df.to_csv(output_dir / "test_predictions.csv", index=False)
+            ml_test_metrics = compute_classification_metrics(test_df["expected_label"].tolist(), test_preds)
+
+            # Training diagnostics
+            train_preds = ml_classifier.predict(train_df)
+            ml_train_diagnostics = compute_classification_metrics(train_df["expected_label"].tolist(), train_preds)
+            logger.info(f"ML Held-Out Test Macro-F1: {ml_test_metrics['macro_f1']:.3f} (Train Diagnostic F1: {ml_train_diagnostics['macro_f1']:.3f})")
         else:
             features_df["pred_ml_tree"] = "indeterminate"
     else:
@@ -250,8 +282,6 @@ def run_experiment_matrix(
         "baseline_sched_only": features_df["pred_baseline_sched"].tolist() if not features_df.empty else [],
         "fused_rule_classifier": features_df["predicted_rule_fused"].tolist() if not features_df.empty else [],
     }
-    if ml_fitted:
-        methods["ml_decision_tree"] = features_df["pred_ml_tree"].tolist()
 
     all_metrics = {}
     comparison_rows = []
@@ -272,14 +302,40 @@ def run_experiment_matrix(
             "indeterminate_f1": m["per_class"].get("indeterminate", {}).get("f1", 0.0),
         })
 
+    # Add Decision Tree metrics evaluated strictly on held-out test data
+    if ml_fitted and ml_test_metrics:
+        all_metrics["ml_decision_tree"] = ml_test_metrics
+        all_metrics["ml_train_diagnostics"] = ml_train_diagnostics
+        comparison_rows.append({
+            "method": "ml_decision_tree",
+            "overall_accuracy": ml_test_metrics["overall_accuracy"],
+            "macro_f1": ml_test_metrics["macro_f1"],
+            "abstention_rate": ml_test_metrics["abstention_rate"],
+            "coverage": ml_test_metrics["coverage"],
+            "non_abstained_accuracy": ml_test_metrics["non_abstained_accuracy"],
+            "io_wait_f1": ml_test_metrics["per_class"].get("io_wait_dominated", {}).get("f1", 0.0),
+            "sched_wait_f1": ml_test_metrics["per_class"].get("scheduler_wait_dominated", {}).get("f1", 0.0),
+            "cpu_f1": ml_test_metrics["per_class"].get("cpu_syscall_dominated", {}).get("f1", 0.0),
+            "indeterminate_f1": ml_test_metrics["per_class"].get("indeterminate", {}).get("f1", 0.0),
+        })
+
     comparison_df = pd.DataFrame(comparison_rows)
     comparison_df.to_csv(output_dir / "baseline_comparison.csv", index=False)
 
-    # Overhead metrics
+    # Overhead metrics: like-for-like comparison of internal workload durations
     flat_unmon = [v for sub in unmonitored_durations_map.values() for v in sub]
     flat_mon = [v for sub in monitored_durations_map.values() for v in sub]
-    overhead_res = compute_overhead_metrics(flat_unmon, flat_mon, total_events=len(all_events), dropped_events=0)
+    overhead_res = compute_overhead_metrics(flat_unmon, flat_mon, total_events=len(all_events), dropped_events=total_dropped_events)
     all_metrics["instrumentation_overhead"] = overhead_res
+
+    # Per-workload overhead breakdown
+    per_workload_overhead = {}
+    for w in workload_types:
+        u_sub = unmonitored_durations_map.get(w, [])
+        m_sub = monitored_durations_map.get(w, [])
+        if u_sub and m_sub:
+            per_workload_overhead[w] = compute_overhead_metrics(u_sub, m_sub, total_events=0, dropped_events=0)
+    all_metrics["per_workload_overhead"] = per_workload_overhead
 
     with open(output_dir / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(all_metrics, f, indent=2)

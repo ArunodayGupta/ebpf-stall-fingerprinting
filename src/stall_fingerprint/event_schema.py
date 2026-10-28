@@ -74,6 +74,7 @@ class SchedEvent(BaseEvent):
     target_pid: int = 0
     is_on_cpu: bool = False
     runnable_delay_ns: int = 0
+    on_cpu_duration_ns: int = 0
 
 @dataclass
 class DiagnosticEvent(BaseEvent):
@@ -143,6 +144,7 @@ def parse_event(data: Union[str, Dict[str, Any]]) -> BaseEvent:
             target_pid=data.get("target_pid", 0),
             is_on_cpu=data.get("is_on_cpu", False),
             runnable_delay_ns=data.get("runnable_delay_ns", 0),
+            on_cpu_duration_ns=data.get("on_cpu_duration_ns", 0),
         )
     elif event_type == EventType.COLLECTOR_DIAGNOSTIC.value:
         return DiagnosticEvent(

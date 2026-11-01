@@ -22,7 +22,7 @@
 |                                         | Filtered Events                         |
 |                                         v                                         |
 |                 +-----------------------------------------------+                 |
-|                 |      BPF_PERF_OUTPUT Ring Buffer (64 pages)   |                 |
+|                 |      BPF_PERF_OUTPUT Ring Buffer (256 pages)  |                 |
 |                 +-----------------------+-----------------------+                 |
 +------------------------------------------|----------------------------------------+
                                            | Polled via BCC ctypes
@@ -45,7 +45,7 @@
 1. **In-Kernel Telemetry Collection (`src/stall_fingerprint/bpf_program.py`)**:
    - Compiled via BCC from embedded C code.
    - Attaches strictly to stable kernel tracepoints (`syscalls`, `block`, `sched`).
-   - Implements in-kernel filtering using `BPF_HASH(target_pids)` to eliminate tracing overhead on untraced background processes (Craun et al., 2024).
+   - Implements in-kernel filtering using `BPF_HASH(target_pids)` on standard Linux and unique task-name markers for controlled workloads when WSL PID namespaces make numeric IDs differ between user space and BPF.
 
 2. **Event Delivery & Loss Accounting (`src/stall_fingerprint/collector.py`)**:
    - Streams events using BCC perf output buffers.

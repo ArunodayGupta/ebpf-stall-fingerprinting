@@ -102,7 +102,7 @@ def generate_latex_tables(results_dir: Path, report_dir: Path):
     ov_pct = ov.get("overhead_percent", 0.0)
 
     macros = [
-        f"\\newcommand{{\\ValFusedMacroF1}}{{{macro_f1_val:.3f}}}",
+        f"\\newcommand{{\\ValFusedMacroFOne}}{{{macro_f1_val:.3f}}}",
         f"\\newcommand{{\\ValFusedAccuracy}}{{{acc_val:.3f}}}",
         f"\\newcommand{{\\ValFusedCoverage}}{{{cov_val:.1f}\\%}}",
         f"\\newcommand{{\\ValOverheadPercent}}{{{ov_pct:.1f}\\%}}",

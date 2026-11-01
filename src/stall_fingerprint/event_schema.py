@@ -72,6 +72,7 @@ class SchedEvent(BaseEvent):
     next_pid: int = 0
     next_comm: str = ""
     target_pid: int = 0
+    comm: str = ""
     is_on_cpu: bool = False
     runnable_delay_ns: int = 0
     on_cpu_duration_ns: int = 0
@@ -142,6 +143,7 @@ def parse_event(data: Union[str, Dict[str, Any]]) -> BaseEvent:
             next_pid=data.get("next_pid", 0),
             next_comm=data.get("next_comm", ""),
             target_pid=data.get("target_pid", 0),
+            comm=data.get("comm", ""),
             is_on_cpu=data.get("is_on_cpu", False),
             runnable_delay_ns=data.get("runnable_delay_ns", 0),
             on_cpu_duration_ns=data.get("on_cpu_duration_ns", 0),

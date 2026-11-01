@@ -165,7 +165,11 @@ def extract_features_from_correlated_window(cw: WindowCorrelatedEvents) -> Dict[
     # Dropped event rate
     tot_telemetry = storage_syscall_count + sleep_syscall_count + target_block_issue_count + target_block_complete_count + sched_switch_count
     dropped_cnt = cw.dropped_events_count
-    dropped_rate = (dropped_cnt / (dropped_cnt + tot_telemetry)) if (dropped_cnt + tot_telemetry) > 0 else 0.0
+    emitted_cnt = max(int(getattr(op, "total_events_emitted", 0) or 0), 0)
+    if emitted_cnt + dropped_cnt > 0:
+        dropped_rate = dropped_cnt / (emitted_cnt + dropped_cnt)
+    else:
+        dropped_rate = (dropped_cnt / (dropped_cnt + tot_telemetry)) if (dropped_cnt + tot_telemetry) > 0 else 0.0
 
     return {
         "trial_id": op.trial_id,
@@ -226,6 +230,7 @@ def extract_features_from_correlated_window(cw: WindowCorrelatedEvents) -> Dict[
         "unobserved_ratio": round(unobserved_ratio, 4),
         "is_empty_window": is_empty_window,
         "dropped_event_count": dropped_cnt,
+        "total_events_emitted": emitted_cnt,
         "dropped_event_rate": round(dropped_rate, 4),
     }
 

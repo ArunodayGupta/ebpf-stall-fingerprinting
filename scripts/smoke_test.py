@@ -31,7 +31,7 @@ from stall_fingerprint.event_schema import (
     EventReader,
 )
 from workloads.cpu_workload import run_cpu_workload
-from workloads.workload_utils import WorkloadOperationRecord
+from workloads.workload_utils import WorkloadOperationRecord, make_target_comm, set_thread_comm
 from stall_fingerprint.correlation import EventCorrelator
 from stall_fingerprint.feature_extraction import extract_features_from_correlated_window
 from stall_fingerprint.classifier_rules import RuleBasedClassifier
@@ -117,7 +117,15 @@ def run_smoke_test():
         from stall_fingerprint.collector import BPFCollector
         live_events_file = smoke_dir / "live_smoke_events.jsonl"
         my_pid = os.getpid()
-        collector = BPFCollector(output_path=live_events_file, target_pids=[my_pid])
+        target_comm = make_target_comm(f"smoke-{my_pid}")
+        set_thread_comm(target_comm)
+        if live_events_file.exists():
+            live_events_file.unlink()
+        collector = BPFCollector(
+            output_path=live_events_file,
+            target_pids=[my_pid],
+            target_comms=[target_comm],
+        )
         try:
             collector.start()
             print(f"      eBPF probes attached. Target PID registered: {my_pid}")
@@ -136,8 +144,14 @@ def run_smoke_test():
             live_reader = EventReader(live_events_file)
             live_events = live_reader.read_all()
             print(f"      Live probe capture succeeded: {len(live_events)} events emitted from kernel.")
-            has_target = any(getattr(e, "pid", 0) == my_pid for e in live_events)
-            assert has_target, f"Expected events for registered PID {my_pid} in perf buffer."
+            has_target = any(
+                getattr(e, "pid", 0) == my_pid or getattr(e, "comm", "") == target_comm
+                for e in live_events
+            )
+            assert has_target, (
+                f"Expected events for registered PID {my_pid} or task marker {target_comm} "
+                "in perf buffer."
+            )
             print("      Live eBPF target registration and event emission VERIFIED.")
         except Exception as e:
             print(f"      ERROR in live eBPF attachment: {e}")

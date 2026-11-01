@@ -88,3 +88,24 @@ def test_feature_extraction_empty_window():
     assert feat["is_empty_window"] == 1
     assert feat["unobserved_ratio"] == 1.0
     assert feat["on_cpu_ratio"] == 0.0
+
+def test_feature_extraction_uses_trial_level_event_loss_totals():
+    op = WorkloadOperationRecord(
+        trial_id="t_drops",
+        workload_type="cpu_bound",
+        operation_id=1,
+        pid=1000,
+        tid=1000,
+        start_ns=0,
+        end_ns=10_000_000,
+        duration_ns=10_000_000,
+        intervention_label="cpu",
+        expected_label="cpu_syscall_dominated",
+        dropped_events_count=100,
+        total_events_emitted=900,
+    )
+    cw = WindowCorrelatedEvents(operation=op, dropped_events_count=100)
+    feat = extract_features_from_correlated_window(cw)
+    assert feat["dropped_event_count"] == 100
+    assert feat["total_events_emitted"] == 900
+    assert feat["dropped_event_rate"] == 0.1

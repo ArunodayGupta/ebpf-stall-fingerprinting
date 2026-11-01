@@ -14,7 +14,7 @@ import time
 import logging
 import multiprocessing as mp
 from typing import List, Dict, Any, Optional, Callable
-from workloads.workload_utils import WorkloadOperationRecord
+from workloads.workload_utils import WorkloadOperationRecord, make_target_comm, set_thread_comm
 from workloads.cpu_workload import run_cpu_workload
 from workloads.read_workload import run_read_workload
 from workloads.write_workload import run_write_workload
@@ -46,7 +46,14 @@ def _dispatch_single_workload(
     elif workload_type == "scheduler_contention":
         iters = params.get("cpu_iterations", 500000)
         workers = params.get("contention_worker_count", 4)
-        return run_scheduler_contention_workload(trial_id=trial_id, target_iterations=iters, competing_workers=workers, concurrency=concurrency)
+        oversubscription = params.get("contention_cpu_oversubscription", 2)
+        return run_scheduler_contention_workload(
+            trial_id=trial_id,
+            target_iterations=iters,
+            competing_workers=workers,
+            concurrency=concurrency,
+            cpu_oversubscription=oversubscription,
+        )
     elif workload_type == "intentional_sleep_control":
         s_dur = params.get("sleep_duration_ms", 150)
         return run_sleep_workload(trial_id=trial_id, sleep_duration_ms=s_dur, concurrency=concurrency)
@@ -59,6 +66,7 @@ def _worker_process_entry(
     parent_trial_id: str,
     concurrency: int,
     params: Dict[str, Any],
+    target_comm: str,
     ready_queue: Any,
     start_event: Any,
     result_queue: Any,
@@ -66,11 +74,13 @@ def _worker_process_entry(
     """Worker entry point enforcing registration before beginning timed execution."""
     try:
         pid = os.getpid()
-        ready_queue.put(pid)
+        set_thread_comm(target_comm)
+        ready_queue.put((pid, target_comm))
         # Block until supervisor has registered PID in kernel BPF map
         start_event.wait()
         rec = _dispatch_single_workload(workload_type, worker_trial_id, concurrency, params)
         rec.parent_trial_id = parent_trial_id
+        rec.target_comm = target_comm
         result_queue.put((True, rec))
     except Exception as e:
         result_queue.put((False, str(e)))
@@ -90,15 +100,21 @@ class WorkloadSupervisor:
         concurrency: int = 1,
         params: Optional[Dict[str, Any]] = None,
         register_pid_fn: Optional[Callable[[int], None]] = None,
+        register_comm_fn: Optional[Callable[[str], None]] = None,
     ) -> List[WorkloadOperationRecord]:
         p_params = params or {}
         records: List[WorkloadOperationRecord] = []
 
         if concurrency == 1:
+            target_comm = make_target_comm(trial_id)
+            set_thread_comm(target_comm)
             if register_pid_fn:
                 register_pid_fn(os.getpid())
+            if register_comm_fn:
+                register_comm_fn(target_comm)
             rec = _dispatch_single_workload(workload_type, trial_id, concurrency, p_params)
             rec.parent_trial_id = trial_id
+            rec.target_comm = target_comm
             records.append(rec)
         else:
             ready_queue = mp.Queue()
@@ -108,6 +124,7 @@ class WorkloadSupervisor:
 
             for i in range(concurrency):
                 worker_trial_id = f"{trial_id}_worker_{i}"
+                target_comm = make_target_comm(worker_trial_id)
                 p = mp.Process(
                     target=_worker_process_entry,
                     args=(
@@ -116,6 +133,7 @@ class WorkloadSupervisor:
                         trial_id,
                         concurrency,
                         p_params,
+                        target_comm,
                         ready_queue,
                         start_event,
                         result_queue,
@@ -128,10 +146,12 @@ class WorkloadSupervisor:
             # Wait for all workers to spawn and report their PIDs
             worker_pids = []
             for _ in range(concurrency):
-                w_pid = ready_queue.get(timeout=15.0)
+                w_pid, target_comm = ready_queue.get(timeout=15.0)
                 worker_pids.append(w_pid)
                 if register_pid_fn:
                     register_pid_fn(w_pid)
+                if register_comm_fn:
+                    register_comm_fn(target_comm)
 
             # Release startup barrier: all processes start timed work simultaneously
             start_event.set()

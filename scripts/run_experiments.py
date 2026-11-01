@@ -151,6 +151,7 @@ def run_experiment_matrix(
     # 2. Measure Monitored Workloads with eBPF Tracing
     logger.info("--- Phase 2: Executing Monitored Tracing Workloads ---")
     total_dropped_events = 0
+    total_emitted_events = 0
 
     with EventWriter(raw_events_path) as event_writer:
         for w_type in workload_types:
@@ -165,6 +166,7 @@ def run_experiment_matrix(
                             collector = BPFCollector(
                                 output_path=raw_events_path,
                                 perf_page_cnt=config.get("collector", {}).get("perf_buffer_page_cnt", 64),
+                                poll_timeout_ms=config.get("collector", {}).get("poll_timeout_ms", 100),
                             )
                             collector.start()
                         except Exception as e:
@@ -178,6 +180,8 @@ def run_experiment_matrix(
 
                     # Execute workload with target PID registration coordination
                     reg_fn = collector.add_target_pid if collector is not None else None
+                    comm_fn = collector.add_target_comm if collector is not None else None
+                    recs = []
                     try:
                         recs = supervisor.execute_workload_trial(
                             workload_type=w_type,
@@ -185,10 +189,14 @@ def run_experiment_matrix(
                             concurrency=conc,
                             params=profile,
                             register_pid_fn=reg_fn,
+                            register_comm_fn=comm_fn,
                         )
-                        # Record inner workload duration for honest, like-for-like comparison
-                        for r in recs:
-                            monitored_durations_map[w_type].append(r.duration_ns / 1_000_000)
+                        # Compare instrumentation overhead at concurrency 1 against the
+                        # concurrency-1 unmonitored control. Higher concurrency levels
+                        # measure contention effects and must not inflate this metric.
+                        if conc == 1:
+                            for r in recs:
+                                monitored_durations_map[w_type].append(r.duration_ns / 1_000_000)
                         all_op_records.extend(recs)
                     except Exception as e:
                         logger.error(f"Workload {trial_id} failed: {e}")
@@ -196,8 +204,12 @@ def run_experiment_matrix(
                             raise
                     finally:
                         if collector is not None:
-                            total_dropped_events += collector.total_events_lost
                             collector.stop()
+                            total_dropped_events += collector.total_events_lost
+                            total_emitted_events += collector.total_events_emitted
+                            for record in recs:
+                                record.dropped_events_count = collector.total_events_lost
+                                record.total_events_emitted = collector.total_events_emitted
 
     # Save workload operations metadata table
     workload_df = pd.DataFrame([r.to_dict() for r in all_op_records])
@@ -325,7 +337,12 @@ def run_experiment_matrix(
     # Overhead metrics: like-for-like comparison of internal workload durations
     flat_unmon = [v for sub in unmonitored_durations_map.values() for v in sub]
     flat_mon = [v for sub in monitored_durations_map.values() for v in sub]
-    overhead_res = compute_overhead_metrics(flat_unmon, flat_mon, total_events=len(all_events), dropped_events=total_dropped_events)
+    overhead_res = compute_overhead_metrics(
+        flat_unmon,
+        flat_mon,
+        total_events=total_emitted_events,
+        dropped_events=total_dropped_events,
+    )
     all_metrics["instrumentation_overhead"] = overhead_res
 
     # Per-workload overhead breakdown

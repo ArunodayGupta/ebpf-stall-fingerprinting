@@ -92,6 +92,7 @@ Measures task runnable delay and off-CPU transitions.
 | `event_type` | string | `SCHED_WAKEUP` or `SCHED_SWITCH` |
 | `timestamp_ns` | int64 | Monotonic timestamp |
 | `target_pid` | int32 | PID of the monitored task transitioning |
+| `comm` | string | Task command name; controlled runs may use a unique marker for PID-namespace-safe correlation |
 | `prev_pid` | int32 | Outgoing PID on CPU switch |
 | `next_pid` | int32 | Incoming PID on CPU switch |
 | `prev_state` | int32 | Outgoing task state (`0` = `TASK_RUNNING` / preempted) |

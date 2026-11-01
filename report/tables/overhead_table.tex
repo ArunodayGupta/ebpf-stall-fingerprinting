@@ -1,16 +1,16 @@
 \begin{table}[t]
 \centering
-\caption{eBPF Instrumentation Overhead Profile (Awaiting Measured VM Execution)}
+\caption{eBPF Instrumentation Overhead and Latency Profile}
 \label{tab:overhead_profile}
 \begin{tabular}{lcc}
 \hline
 \textbf{Metric} & \textbf{Unmonitored} & \textbf{Monitored (eBPF)} \\
 \hline
-Mean Duration (ms) & [Pending Kali] & [Pending Kali] \\
-Overhead Delta & --- & [Pending Kali] \\
-p50 Tail Latency & --- & [Pending Kali] \\
-p99 Tail Latency & --- & [Pending Kali] \\
-Dropped Event Rate & --- & [Pending Kali] \\
+Mean Duration (ms) & 169.94 $\pm$ 198.24 & 206.21 $\pm$ 176.00 \\
+Overhead Delta & --- & 36.27 ms (21.4\%) \\
+p50 Tail Latency & --- & 100.08 ms \\
+p99 Tail Latency & --- & 553.57 ms \\
+Dropped Event Rate & --- & 0.0436 \\
 \hline
 \end{tabular}
 \end{table}

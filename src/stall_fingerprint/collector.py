@@ -14,10 +14,11 @@ import time
 import threading
 import logging
 import ctypes
+import platform
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Union
 
-from stall_fingerprint.bpf_program import BPF_C_SOURCE, KernelEventCStruct, SYSCALL_ID_TO_NAME
+from stall_fingerprint.bpf_program import BPF_C_SOURCE, KernelEventCStruct, SYSCALL_ID_TO_NAME, task_comm_hash
 from stall_fingerprint.event_schema import (
     EventType,
     BaseEvent,
@@ -44,11 +45,14 @@ class BPFCollector:
         self,
         output_path: Union[str, Path],
         target_pids: Optional[List[int]] = None,
+        target_comms: Optional[List[str]] = None,
         perf_page_cnt: int = 64,
         poll_timeout_ms: int = 100,
     ):
         self.output_path = Path(output_path)
         self.target_pids = list(target_pids or [])
+        self.target_comms = list(target_comms or [])
+        self.use_pid_filter = "microsoft" not in platform.release().lower()
         self.perf_page_cnt = perf_page_cnt
         self.poll_timeout_ms = poll_timeout_ms
 
@@ -82,7 +86,7 @@ class BPFCollector:
         for p in pids_to_register:
             if p not in self.target_pids:
                 self.target_pids.append(p)
-            if self.bpf_instance is not None:
+            if self.bpf_instance is not None and self.use_pid_filter:
                 try:
                     target_map = self.bpf_instance["target_pids"]
                     target_map[ctypes.c_uint32(p)] = ctypes.c_uint8(1)
@@ -94,6 +98,16 @@ class BPFCollector:
         """Register a list of target PIDs."""
         for p in pids:
             self.add_target_pid(p)
+
+    def add_target_comm(self, comm: str):
+        """Register a task name as an alternative identity for PID namespaces."""
+        comm = comm.encode("utf-8")[:15].decode("utf-8", errors="ignore")
+        if not comm:
+            return
+        if comm not in self.target_comms:
+            self.target_comms.append(comm)
+        if self.bpf_instance is not None:
+            self.bpf_instance["target_comms"][ctypes.c_uint32(task_comm_hash(comm))] = ctypes.c_uint8(1)
 
     def initialize_bpf(self):
         """Compile BPF source and attach probes via BCC."""
@@ -119,8 +133,12 @@ class BPFCollector:
 
         # Populate initial target PIDs
         target_map = self.bpf_instance["target_pids"]
-        for pid in self.target_pids:
-            target_map[ctypes.c_uint32(pid)] = ctypes.c_uint8(1)
+        if self.use_pid_filter:
+            for pid in self.target_pids:
+                target_map[ctypes.c_uint32(pid)] = ctypes.c_uint8(1)
+        comm_map = self.bpf_instance["target_comms"]
+        for comm in self.target_comms:
+            comm_map[ctypes.c_uint32(task_comm_hash(comm))] = ctypes.c_uint8(1)
 
         self.probe_status["compilation"] = "SUCCESS"
         logger.info("eBPF probes verified and loaded into kernel.")
@@ -166,6 +184,7 @@ class BPFCollector:
                 event = SchedEvent(
                     event_type=t_str,
                     timestamp_ns=ts,
+                    comm=comm,
                     prev_pid=c_event.prev_pid,
                     next_pid=c_event.next_pid,
                     prev_state=c_event.prev_state,
@@ -246,6 +265,8 @@ class BPFCollector:
                 message="eBPF collector initialized and tracing started",
                 details={
                     "target_pids": self.target_pids,
+                    "target_comms": self.target_comms,
+                    "pid_filter_enabled": self.use_pid_filter,
                     "perf_page_cnt": self.perf_page_cnt,
                 },
             )

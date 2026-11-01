@@ -82,10 +82,19 @@ class EventCorrelator:
     ) -> WindowCorrelatedEvents:
         target_pid = op.pid
         target_tid = getattr(op, "tid", target_pid)
+        target_comm = getattr(op, "target_comm", "")
         win_start = op.start_ns - self.window_margin_ns
         win_end = op.end_ns + self.window_margin_ns
 
-        matched = WindowCorrelatedEvents(operation=op)
+        trial_dropped_count = max(int(getattr(op, "dropped_events_count", 0) or 0), 0)
+        has_trial_loss_totals = (
+            int(getattr(op, "total_events_emitted", 0) or 0) > 0
+            or trial_dropped_count > 0
+        )
+        matched = WindowCorrelatedEvents(
+            operation=op,
+            dropped_events_count=trial_dropped_count,
+        )
 
         for ev in events:
             # Check timestamp overlap
@@ -95,15 +104,18 @@ class EventCorrelator:
 
             if isinstance(ev, SyscallEvent):
                 # Match by PID or TID
-                if ev.pid == target_pid or ev.tid == target_pid or ev.tid == target_tid or target_pid == 0:
+                if target_comm:
+                    is_target = ev.comm == target_comm
+                else:
+                    is_target = ev.pid == target_pid or ev.tid == target_pid or ev.tid == target_tid or target_pid == 0
+                if is_target:
                     matched.syscall_events.append(ev)
             elif isinstance(ev, BlockEvent):
                 # Distinguish target-associated block I/O from background activity
-                is_target = (
-                    (ev.pid == target_pid) or
-                    (target_tid != 0 and ev.pid == target_tid) or
-                    (target_pid == 0)
-                )
+                if target_comm:
+                    is_target = ev.comm == target_comm
+                else:
+                    is_target = ev.pid == target_pid or (target_tid != 0 and ev.pid == target_tid) or target_pid == 0
 
                 if self.attribution_mode == "all_window":
                     # Ablation mode: treat any block event in window as target evidence
@@ -114,17 +126,24 @@ class EventCorrelator:
                     else:
                         matched.background_block_events.append(ev)
             elif isinstance(ev, SchedEvent):
-                is_sched_target = (
-                    ev.target_pid == target_pid or
-                    ev.next_pid == target_pid or
-                    ev.prev_pid == target_pid or
-                    (target_tid != 0 and (ev.target_pid == target_tid or ev.next_pid == target_tid or ev.prev_pid == target_tid)) or
-                    target_pid == 0
-                )
+                if target_comm:
+                    is_sched_target = ev.comm == target_comm or ev.prev_comm == target_comm or ev.next_comm == target_comm
+                else:
+                    is_sched_target = (
+                        ev.target_pid == target_pid or
+                        ev.next_pid == target_pid or
+                        ev.prev_pid == target_pid or
+                        (target_tid != 0 and (ev.target_pid == target_tid or ev.next_pid == target_tid or ev.prev_pid == target_tid)) or
+                        target_pid == 0
+                    )
                 if is_sched_target:
                     matched.sched_events.append(ev)
             elif ev.event_type == EventType.DROPPED_EVENT_STATS.value:
-                matched.dropped_events_count += getattr(ev, "total_events_lost", 0)
+                if not has_trial_loss_totals:
+                    matched.dropped_events_count = max(
+                        matched.dropped_events_count,
+                        getattr(ev, "total_events_lost", 0),
+                    )
             elif ev.event_type == EventType.COLLECTOR_DIAGNOSTIC.value:
                 matched.diagnostic_count += 1
 

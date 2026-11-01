@@ -32,6 +32,23 @@ def test_classify_io_wait(classifier):
     assert pred.confidence >= 0.70
     assert "RULE_IO_WAIT_FUSED" in pred.rule_fired
 
+def test_io_wait_with_blocked_off_cpu_time_is_not_treated_as_sleep(classifier):
+    features = {
+        "wall_duration_ns": 10_000_000,
+        "syscall_duration_ratio": 0.70,
+        "has_target_block_activity": 1,
+        "target_block_bytes": 65536,
+        "sched_wait_ratio": 0.02,
+        "off_cpu_blocked_ratio": 0.70,
+        "sleep_syscall_ratio": 0.0,
+        "on_cpu_ratio": 0.20,
+        "unobserved_ratio": 0.0,
+        "is_empty_window": 0,
+    }
+    pred = classifier.predict_sample(features)
+    assert pred.predicted_label == LABEL_IO_WAIT
+    assert pred.rule_fired == "RULE_IO_WAIT_FUSED"
+
 def test_classify_sched_wait(classifier):
     features = {
         "wall_duration_ns": 10_000_000,

@@ -15,6 +15,8 @@ Every observed operation window $[t_{start}, t_{end}]$ is categorized into one o
 4. **`indeterminate`**:
    Telemetry is absent, corrupt, contradictory, or insufficient (e.g. deliberate sleep delay where task is voluntarily blocked without storage I/O, or cached file reads where syscalls occur without device block requests).
 
+Explicit sleep syscalls are used to recognize the intentional-sleep control. Off-CPU blocked time alone is not treated as proof of sleep, because synchronous storage waits also block the task; those windows are evaluated against syscall and block-layer evidence first.
+
 ---
 
 ## 2. Quantitative Feature Mathematics

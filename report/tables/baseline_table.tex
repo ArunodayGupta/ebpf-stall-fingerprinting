@@ -1,15 +1,18 @@
 \begin{table}[t]
 \centering
-\caption{Comparison Across Baselines (Awaiting Measured VM Execution)}
+\caption{Comparison of Classification Performance Across Single-Source Baselines and Fused System}
 \label{tab:baseline_comparison}
-\begin{tabular}{lcccc}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lcccccc}
 \hline
-\textbf{Method} & \textbf{Macro-F1} & \textbf{Accuracy} & \textbf{Coverage} & \textbf{Non-Abst. Acc} \\
+\textbf{Method} & \textbf{Macro-F1} & \textbf{Accuracy} & \textbf{Coverage} & \textbf{Non-Abst. Acc} & \textbf{I/O F1} & \textbf{Sched F1} \\
 \hline
-Syscall Only & [Pending Kali] & [Pending] & [Pending] & [Pending] \\
-Block-Layer Only & [Pending Kali] & [Pending] & [Pending] & [Pending] \\
-Scheduler Only & [Pending Kali] & [Pending] & [Pending] & [Pending] \\
-\textbf{Fused Rule Classifier} & [Pending Kali] & [Pending] & [Pending] & [Pending] \\
+Syscall Duration Only & 0.343 & 0.467 & 76.7\% & 0.609 & 0.800 & 0.000 \\
+Block-Layer Only & 0.375 & 0.600 & 40.0\% & 1.000 & 1.000 & 0.000 \\
+Scheduler Wait Only & 0.350 & 0.400 & 20.0\% & 1.000 & 0.000 & 1.000 \\
+\textbf{Fused Rule Classifier} & 0.970 & 0.967 & 76.7\% & 1.000 & 0.957 & 1.000 \\
+Decision Tree (ML) & 1.000 & 1.000 & 71.4\% & 1.000 & 1.000 & 1.000 \\
 \hline
 \end{tabular}
+}
 \end{table}

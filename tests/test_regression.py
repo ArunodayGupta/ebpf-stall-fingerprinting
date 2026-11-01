@@ -19,6 +19,7 @@ from stall_fingerprint.event_schema import (
     SchedEvent,
 )
 from workloads.workload_utils import WorkloadOperationRecord
+from workloads.scheduler_contention import effective_competing_worker_count
 from stall_fingerprint.correlation import EventCorrelator, WindowCorrelatedEvents
 from stall_fingerprint.feature_extraction import extract_features_from_correlated_window
 from stall_fingerprint.classifier_rules import (
@@ -264,3 +265,10 @@ def test_regression_like_for_like_overhead_calculation():
     assert ov["overhead_percent"] == 4.0
     assert ov["dropped_events"] == 5
     assert ov["dropped_event_rate"] == 0.001
+
+def test_scheduler_contention_scales_background_workers_to_cpu_load():
+    assert effective_competing_worker_count(2, 1, 12, 2) == 24
+    assert effective_competing_worker_count(4, 4, 12, 2) == 6
+    assert effective_competing_worker_count(8, 4, 12, 2) == 8
+    assert effective_competing_worker_count(2, 1, 12, 2, pinned_to_single_cpu=True) == 2
+    assert effective_competing_worker_count(4, 4, 12, 2, pinned_to_single_cpu=True) == 4

@@ -86,7 +86,7 @@ Gregg~\cite{gregg2019bpf} formalized off-CPU analysis for diagnosing application
 \subsection{System Architecture}
 Our architecture consists of three core subsystems:
 1) \textit{Kernel-side eBPF Instrumentation Engine}: Compiles embedded C code using the BPF Compiler Collection (BCC) and attaches to kernel tracepoints.
-2) \textit{Telemetry Delivery and Event Buffer}: Streams structured C structs across a 64-page perf ring buffer with automatic loss detection (\texttt{lost\_cb}).
+2) \textit{Telemetry Delivery and Event Buffer}: Streams structured C structs across a 256-page perf ring buffer with automatic loss detection (\texttt{lost\_cb}).
 3) \textit{User-Space Correlation and Classification Pipeline}: Parses JSON Lines events, calculates non-overlapping interval unions, extracts quantitative features, and evaluates classification models.
 
 \subsection{Tracepoint Selection and In-Kernel Logic}

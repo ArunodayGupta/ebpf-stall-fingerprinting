@@ -6,6 +6,8 @@ import os
 import sys
 import time
 import json
+import ctypes
+import hashlib
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -25,6 +27,9 @@ class WorkloadOperationRecord:
     concurrency: int = 1
     parent_trial_id: str = ""
     parameters: Dict[str, Any] = field(default_factory=dict)
+    target_comm: str = ""
+    dropped_events_count: int = 0
+    total_events_emitted: int = 0
 
     def __post_init__(self):
         if not self.parent_trial_id:
@@ -42,6 +47,24 @@ class WorkloadOperationRecord:
 def get_monotonic_ns() -> int:
     """Returns high-resolution monotonic time in nanoseconds matching kernel bpf_ktime_get_ns()."""
     return time.monotonic_ns()
+
+def make_target_comm(identity: str) -> str:
+    """Return a stable, short Linux task name for telemetry correlation."""
+    digest = hashlib.blake2s(identity.encode("utf-8"), digest_size=6).hexdigest()
+    return f"sfp{digest}"[:15]
+
+def set_thread_comm(comm: str) -> None:
+    """Set the calling Linux task's comm field (PR_SET_NAME, limited to 15 bytes)."""
+    if os.name != "posix" or not hasattr(ctypes, "CDLL"):
+        return
+    value = comm.encode("utf-8")[:15]
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+    prctl.restype = ctypes.c_int
+    if prctl(15, value, 0, 0, 0) != 0:  # PR_SET_NAME
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
 
 def isolate_test_directory(base_dir: str = "data") -> Path:
     """Creates a dedicated, isolated directory for temporary workload files."""

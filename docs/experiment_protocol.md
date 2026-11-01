@@ -42,7 +42,9 @@ To ensure rigorous, scientifically reproducible results, all experiments follow 
 | File Size (I/O) | 8 MB | 32 MB |
 | CPU Iterations | 500,000 | 2,000,000 |
 | Sleep Duration | 100 ms | 200 ms |
-| Contention Workers | 2 | 4 |
+| Minimum Contention Workers per Target | 2 | 4 |
+
+The scheduler workload pins each target and its stress workers to one CPU selected from the process's allowed CPU set. It runs at least the configured minimum number of stress workers per target (and at least the configured oversubscription factor). This creates a controlled runqueue bottleneck on hosts with many CPUs, including WSL.
 
 ---
 

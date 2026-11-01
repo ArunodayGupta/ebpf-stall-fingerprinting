@@ -100,17 +100,26 @@ class RuleBasedClassifier:
                 ),
             )
 
-        # Rule 0b: Voluntary Sleep / Negative-Control Abstention
-        max_sleep_signal = max(off_cpu_blocked_ratio, sleep_syscall_ratio)
-        if max_sleep_signal >= 0.40:
+        # Rule 0b: Explicit Voluntary Sleep / Negative-Control Abstention
+        # Off-CPU blocked time alone is not enough: synchronous storage waits also
+        # leave the task blocked and must be corroborated by syscall/block signals.
+        explicit_sleep = sleep_syscall_ratio >= 0.40
+        unexplained_blocking = (
+            off_cpu_blocked_ratio >= 0.40
+            and syscall_ratio < self.io_syscall_ratio_thresh
+            and not has_target_block
+            and fsync_cnt == 0
+        )
+        if explicit_sleep or unexplained_blocking:
+            sleep_signal = sleep_syscall_ratio if explicit_sleep else off_cpu_blocked_ratio
             return RulePrediction(
                 predicted_label=LABEL_INDETERMINATE,
                 confidence=0.95,
                 rule_fired="RULE_OFF_CPU_VOLUNTARY_SLEEP",
                 contributing_signals=contributing,
                 explanation=(
-                    f"Task spent dominant time voluntarily blocked off-CPU ({max_sleep_signal:.2f}), "
-                    "not runnable or stalled on storage. Validated negative control (abstention)."
+                    f"Voluntary sleep or other non-storage blocking occupied {sleep_signal:.2f} "
+                    "of the operation window without storage corroboration. Result marked indeterminate."
                 ),
             )
 
@@ -142,7 +151,27 @@ class RuleBasedClassifier:
                 ),
             )
 
-        # Rule 2: I/O Wait Dominance (Syscall duration + Target-attributed Block layer corroboration or sync calls)
+        # Rule 2: I/O Wait Dominance. A long storage syscall needs corroboration;
+        # on WSL, syscall timing can be diluted by tracing overhead, so strong
+        # target-attributed block activity plus blocked time is also sufficient.
+        target_storage_blocking = (
+            has_target_block
+            and off_cpu_blocked_ratio >= 0.40
+            and (fsync_cnt > 0 or target_bytes >= self.io_block_min_bytes)
+        )
+        if target_storage_blocking:
+            conf = min(0.65 + off_cpu_blocked_ratio / 3.0, 0.92)
+            return RulePrediction(
+                predicted_label=LABEL_IO_WAIT,
+                confidence=round(conf, 2),
+                rule_fired="RULE_IO_WAIT_TARGET_BLOCKED",
+                contributing_signals=contributing,
+                explanation=(
+                    f"Target-attributed storage activity ({target_bytes} bytes, fsync={fsync_cnt}) "
+                    f"coincided with blocked time ({off_cpu_blocked_ratio:.2f} of the operation window)."
+                ),
+            )
+
         if syscall_ratio >= self.io_syscall_ratio_thresh:
             if has_target_block or fsync_cnt > 0 or target_bytes >= self.io_block_min_bytes:
                 conf = min(0.60 + syscall_ratio / 2.5, 0.99)

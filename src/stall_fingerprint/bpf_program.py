@@ -9,6 +9,14 @@ Contains embedded C code loaded by BCC into the Linux kernel to trace:
 
 import ctypes
 
+def task_comm_hash(comm: str) -> int:
+    """Match the 32-bit FNV-1a hash used by the embedded BPF program."""
+    value = 2166136261
+    for byte in comm.encode("utf-8")[:15]:
+        value ^= byte
+        value = (value * 16777619) & 0xFFFFFFFF
+    return value
+
 BPF_C_SOURCE = r"""
 #include <uapi/linux/ptrace.h>
 #include <linux/sched.h>
@@ -39,26 +47,6 @@ struct kernel_event_t {
     char rwbs[8];
     s32 error;
 
-struct kernel_event_t {
-    u32 event_type;
-    u64 timestamp_ns;
-    u32 pid;
-    u32 tid;
-    char comm[16];
-
-    // Syscall fields
-    u32 syscall_id;
-    u64 duration_ns;
-    s64 ret;
-
-    // Block fields
-    u32 dev;
-    u64 sector;
-    u32 nr_sector;
-    u32 bytes_count;
-    char rwbs[8];
-    s32 error;
-
     // Sched fields
     u32 prev_pid;
     u32 next_pid;
@@ -68,8 +56,15 @@ struct kernel_event_t {
     u64 on_cpu_duration_ns;
 };
 
+struct request_owner_t {
+    u32 pid;
+    char comm[16];
+};
+
 // Target PIDs filter map: key = PID/TID, val = 1
 BPF_HASH(target_pids, u32, u8, 2048);
+// Target task-name hashes support PID-namespace-isolated environments such as WSL2.
+BPF_HASH(target_comms, u32, u8, 2048);
 
 // Syscall start tracking map: key = ((u64)tid << 32) | syscall_id, val = start_timestamp_ns
 BPF_HASH(syscall_starts, u64, u64, 8192);
@@ -83,14 +78,34 @@ BPF_HASH(on_cpu_starts, u32, u64, 4096);
 // Off-CPU blocked start tracking: key = pid, val = blocked_timestamp_ns
 BPF_HASH(blocked_starts, u32, u64, 4096);
 
-// In-flight block request attribution map: key = ((u64)dev << 32) | sector, val = submitting tgid
-BPF_HASH(inflight_rq, u64, u32, 8192);
+// In-flight block request attribution map: key = ((u64)dev << 32) | sector.
+BPF_HASH(inflight_rq, u64, struct request_owner_t, 8192);
 
 // Perf output ring buffer
 BPF_PERF_OUTPUT(events);
 
 static inline u8 is_target_pid(u32 pid) {
     u8 *val = target_pids.lookup(&pid);
+    return val != NULL;
+}
+
+static inline u32 task_comm_hash(const char *comm) {
+    u32 hash = 2166136261U;
+#pragma unroll
+    for (int i = 0; i < 16; i++) {
+        u8 c = comm[i];
+        if (!c) {
+            break;
+        }
+        hash ^= c;
+        hash *= 16777619U;
+    }
+    return hash;
+}
+
+static inline u8 is_target_comm(const char *comm) {
+    u32 hash = task_comm_hash(comm);
+    u8 *val = target_comms.lookup(&hash);
     return val != NULL;
 }
 
@@ -102,7 +117,9 @@ static inline void record_syscall_enter(void *ctx, u32 syscall_id) {
     u32 tgid = pid_tgid >> 32;
     u32 tid = (u32)pid_tgid;
 
-    if (!is_target_pid(tgid) && !is_target_pid(tid)) {
+    char comm[TASK_COMM_LEN] = {};
+    bpf_get_current_comm(&comm, sizeof(comm));
+    if (!is_target_pid(tgid) && !is_target_pid(tid) && !is_target_comm(comm)) {
         return;
     }
 
@@ -117,7 +134,9 @@ static inline void record_syscall_exit(void *ctx, u32 syscall_id, s64 ret) {
     u32 tgid = pid_tgid >> 32;
     u32 tid = (u32)pid_tgid;
 
-    if (!is_target_pid(tgid) && !is_target_pid(tid)) {
+    char comm[TASK_COMM_LEN] = {};
+    bpf_get_current_comm(&comm, sizeof(comm));
+    if (!is_target_pid(tgid) && !is_target_pid(tid) && !is_target_comm(comm)) {
         return;
     }
 
@@ -139,7 +158,7 @@ static inline void record_syscall_exit(void *ctx, u32 syscall_id, s64 ret) {
     ev.syscall_id = syscall_id;
     ev.duration_ns = duration;
     ev.ret = ret;
-    bpf_get_current_comm(&ev.comm, sizeof(ev.comm));
+    __builtin_memcpy(&ev.comm, comm, sizeof(ev.comm));
 
     events.perf_submit(ctx, &ev, sizeof(ev));
 }
@@ -226,7 +245,10 @@ TRACEPOINT_PROBE(block, block_rq_issue) {
     u32 tgid = pid_tgid >> 32;
 
     u64 rq_key = ((u64)args->dev << 32) | (u32)(args->sector & 0xFFFFFFFF);
-    inflight_rq.update(&rq_key, &tgid);
+    struct request_owner_t owner = {};
+    owner.pid = tgid;
+    bpf_get_current_comm(&owner.comm, sizeof(owner.comm));
+    inflight_rq.update(&rq_key, &owner);
 
     struct kernel_event_t ev = {};
     ev.event_type = EV_BLOCK_RQ_ISSUE;
@@ -250,9 +272,11 @@ TRACEPOINT_PROBE(block, block_rq_complete) {
 
     // Associate completing request with original submitting PID
     u64 rq_key = ((u64)args->dev << 32) | (u32)(args->sector & 0xFFFFFFFF);
-    u32 *submitting_tgid = inflight_rq.lookup(&rq_key);
-    if (submitting_tgid) {
-        tgid = *submitting_tgid;
+    struct request_owner_t *owner = inflight_rq.lookup(&rq_key);
+    char owner_comm[16] = {};
+    if (owner) {
+        tgid = owner->pid;
+        __builtin_memcpy(owner_comm, owner->comm, sizeof(owner_comm));
         inflight_rq.delete(&rq_key);
     }
 
@@ -267,7 +291,11 @@ TRACEPOINT_PROBE(block, block_rq_complete) {
     ev.bytes_count = args->nr_sector * 512;
     ev.error = args->error;
     bpf_probe_read_kernel_str(&ev.rwbs, sizeof(ev.rwbs), args->rwbs);
-    bpf_get_current_comm(&ev.comm, sizeof(ev.comm));
+    if (owner_comm[0]) {
+        __builtin_memcpy(&ev.comm, owner_comm, sizeof(ev.comm));
+    } else {
+        bpf_get_current_comm(&ev.comm, sizeof(ev.comm));
+    }
 
     events.perf_submit(args, &ev, sizeof(ev));
     return 0;
@@ -276,8 +304,8 @@ TRACEPOINT_PROBE(block, block_rq_complete) {
 // -------------------------------------------------------------
 // Scheduler Tracing with Actual On-CPU and Off-CPU Accounting
 // -------------------------------------------------------------
-static inline void handle_wakeup(void *ctx, u32 pid) {
-    if (!is_target_pid(pid)) {
+static inline void handle_wakeup(void *ctx, u32 pid, const char *comm) {
+    if (!is_target_pid(pid) && !is_target_comm(comm)) {
         return;
     }
 
@@ -288,16 +316,21 @@ static inline void handle_wakeup(void *ctx, u32 pid) {
     ev.event_type = EV_SCHED_WAKEUP;
     ev.timestamp_ns = now;
     ev.pid = pid;
+    __builtin_memcpy(&ev.comm, comm, sizeof(ev.comm));
     events.perf_submit(ctx, &ev, sizeof(ev));
 }
 
 TRACEPOINT_PROBE(sched, sched_wakeup) {
-    handle_wakeup(args, args->pid);
+    char comm[TASK_COMM_LEN] = {};
+    __builtin_memcpy(comm, args->comm, sizeof(comm));
+    handle_wakeup(args, args->pid, comm);
     return 0;
 }
 
 TRACEPOINT_PROBE(sched, sched_wakeup_new) {
-    handle_wakeup(args, args->pid);
+    char comm[TASK_COMM_LEN] = {};
+    __builtin_memcpy(comm, args->comm, sizeof(comm));
+    handle_wakeup(args, args->pid, comm);
     return 0;
 }
 
@@ -305,9 +338,13 @@ TRACEPOINT_PROBE(sched, sched_switch) {
     u32 prev_pid = args->prev_pid;
     u32 next_pid = args->next_pid;
     u64 now = bpf_ktime_get_ns();
+    char prev_comm[TASK_COMM_LEN] = {};
+    char next_comm[TASK_COMM_LEN] = {};
+    __builtin_memcpy(prev_comm, args->prev_comm, sizeof(prev_comm));
+    __builtin_memcpy(next_comm, args->next_comm, sizeof(next_comm));
 
     // 1. Next task scheduled onto CPU
-    if (is_target_pid(next_pid)) {
+    if (is_target_pid(next_pid) || is_target_comm(next_comm)) {
         u64 *start_ns = runnable_starts.lookup(&next_pid);
         u64 runnable_delay = 0;
         if (start_ns) {
@@ -325,6 +362,7 @@ TRACEPOINT_PROBE(sched, sched_switch) {
         ev.prev_pid = prev_pid;
         ev.next_pid = next_pid;
         ev.prev_state = args->prev_state;
+        __builtin_memcpy(&ev.comm, next_comm, sizeof(ev.comm));
         ev.is_on_cpu = 1;
         ev.runnable_delay_ns = runnable_delay;
         ev.on_cpu_duration_ns = 0;
@@ -332,7 +370,7 @@ TRACEPOINT_PROBE(sched, sched_switch) {
     }
 
     // 2. Previous task scheduled off CPU
-    if (is_target_pid(prev_pid)) {
+    if (is_target_pid(prev_pid) || is_target_comm(prev_comm)) {
         u64 on_cpu_dur = 0;
         u64 *on_start = on_cpu_starts.lookup(&prev_pid);
         if (on_start) {
@@ -355,6 +393,7 @@ TRACEPOINT_PROBE(sched, sched_switch) {
         ev.prev_pid = prev_pid;
         ev.next_pid = next_pid;
         ev.prev_state = args->prev_state;
+        __builtin_memcpy(&ev.comm, prev_comm, sizeof(ev.comm));
         ev.is_on_cpu = 0;
         ev.runnable_delay_ns = 0;
         ev.on_cpu_duration_ns = on_cpu_dur;

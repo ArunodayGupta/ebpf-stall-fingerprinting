@@ -20,6 +20,9 @@ Executing benchmarks inside an Oracle VirtualBox guest introduces two specific c
 ### C. Kernel Tracepoint Portability Boundaries
 Linux tracepoint arguments evolve between major kernel releases (e.g. Linux 4.x vs 5.x vs 6.x). Tracepoint arguments such as `args->bytes` vs `args->nr_sector * 512` in `block_rq_issue` must be verified via `format` files in tracefs.
 
+### D. WSL PID Namespace and Virtual Disk Boundaries
+WSL 2 distributions can expose process IDs that differ from those returned by kernel eBPF helpers. Controlled project workloads therefore carry a unique task-name marker that the collector can use for syscall and scheduler matching. This marker is limited to the project's own workload processes; it does not provide general PID translation for arbitrary WSL processes. Block-layer telemetry also describes WSL's virtualized storage path, not direct physical-device latency.
+
 ---
 
 ## 2. Ethical Safeguards & Privacy Protections

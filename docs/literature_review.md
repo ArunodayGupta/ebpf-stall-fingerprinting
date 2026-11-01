@@ -20,7 +20,7 @@ This literature survey contextualizes the research problem: distinguishing wheth
 * **Naas et al., "Dissecting Storage I/O Tracing Overhead of eBPF: A Component-Level Analysis" (CHEOPS '26 / EuroSys)** [DOI: `10.1145/3805687.3806254`]  
   * *Problem:* Modern storage engines operate at microsecond scales, exposing significant bottlenecks when tracing block-layer requests.
   * *Key Finding:* Tracing high-frequency block requests causes ring buffer contention and map update lock overhead.
-  * *Motivation for our Design:* Justifies our window-level aggregation strategy and perf buffer sizing (64 pages) to prevent dropped event cascades.
+  * *Motivation for our Design:* Justifies our window-level aggregation strategy and larger perf buffer sizing (256 pages) to reduce dropped event cascades.
 
 ### B. eBPF Memory and Execution Efficiency
 * **Liu, Tak, & Wang, "Understanding Performance of eBPF Maps" (ACM eBPF '24)** [DOI: `10.1145/3672197.3673430`]  

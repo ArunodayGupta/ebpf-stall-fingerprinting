@@ -36,6 +36,10 @@ from stall_fingerprint.feature_extraction import extract_features_table
 from workloads.workload_utils import WorkloadOperationRecord
 from stall_fingerprint.evaluation import compute_classification_metrics
 
+def _row_int(row: pd.Series, key: str, default: int = 0) -> int:
+    value = row.get(key, default)
+    return int(value) if pd.notna(value) else default
+
 class AblationClassifier:
     """Evaluates classifier behavior with targeted feature masks."""
 
@@ -122,6 +126,9 @@ def run_window_margin_ablations(raw_events_path: Path, workload_runs_csv: Path, 
             intervention_label=row["intervention_label"],
             expected_label=row["expected_label"],
             concurrency=int(row.get("concurrency", 1)),
+            target_comm=row.get("target_comm", "") if isinstance(row.get("target_comm", ""), str) else "",
+            dropped_events_count=_row_int(row, "dropped_events_count"),
+            total_events_emitted=_row_int(row, "total_events_emitted"),
         ))
 
     events = EventReader(raw_events_path).read_all()
@@ -174,6 +181,9 @@ def run_attribution_ablation(raw_events_path: Path, workload_runs_csv: Path, bas
             intervention_label=row["intervention_label"],
             expected_label=row["expected_label"],
             concurrency=int(row.get("concurrency", 1)),
+            target_comm=row.get("target_comm", "") if isinstance(row.get("target_comm", ""), str) else "",
+            dropped_events_count=_row_int(row, "dropped_events_count"),
+            total_events_emitted=_row_int(row, "total_events_emitted"),
         ))
 
     events = EventReader(raw_events_path).read_all()

@@ -192,13 +192,25 @@ def check_tracepoints() -> Dict[str, Any]:
         Path("/sys/kernel/debug/tracing"),
     ]
     tracefs = None
+    inaccessible_paths = []
     for p in tracing_paths:
-        if p.exists() and (p / "events").exists():
-            tracefs = p
-            break
+        try:
+            if p.exists() and (p / "events").exists():
+                tracefs = p
+                break
+        except OSError as e:
+            if isinstance(e, PermissionError):
+                inaccessible_paths.append(str(p / "events"))
+            else:
+                res.setdefault("path_errors", {})[str(p)] = str(e)
 
     if not tracefs:
-        res["error"] = "Neither /sys/kernel/tracing nor /sys/kernel/debug/tracing is mounted"
+        if inaccessible_paths:
+            res["error"] = "Tracepoint paths exist but are not readable by this user"
+            res["inaccessible_paths"] = inaccessible_paths
+            res["hint"] = "Re-run with sudo if you need to inspect tracepoint availability."
+        else:
+            res["error"] = "Neither /sys/kernel/tracing nor /sys/kernel/debug/tracing is mounted"
         return res
 
     res["tracefs_mounted"] = True
@@ -228,7 +240,17 @@ def check_tracepoints() -> Dict[str, Any]:
         key = f"{category}:{name}"
         tp_dir = tracefs / "events" / category / name
         tp_format = tp_dir / "format"
-        if tp_dir.exists() and tp_format.exists():
+        try:
+            available = tp_dir.exists() and tp_format.exists()
+        except OSError as e:
+            res["tracepoints"][key] = {
+                "available": False,
+                "path": str(tp_dir),
+                "error": str(e),
+            }
+            continue
+
+        if available:
             fields = []
             try:
                 with open(tp_format, "r", encoding="utf-8", errors="ignore") as f:

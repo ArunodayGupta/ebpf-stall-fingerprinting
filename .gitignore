@@ -40,3 +40,5 @@ report/*.toc
 report/*.synctex.gz
 report/*.fdb_latexmk
 report/*.fls
+report/tables/
+report/macros.tex

@@ -39,26 +39,6 @@ struct kernel_event_t {
     char rwbs[8];
     s32 error;
 
-struct kernel_event_t {
-    u32 event_type;
-    u64 timestamp_ns;
-    u32 pid;
-    u32 tid;
-    char comm[16];
-
-    // Syscall fields
-    u32 syscall_id;
-    u64 duration_ns;
-    s64 ret;
-
-    // Block fields
-    u32 dev;
-    u64 sector;
-    u32 nr_sector;
-    u32 bytes_count;
-    char rwbs[8];
-    s32 error;
-
     // Sched fields
     u32 prev_pid;
     u32 next_pid;

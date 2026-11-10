@@ -122,6 +122,12 @@ sudo apt install -y python3-pip python3-numpy python3-pandas python3-sklearn \
 
 # 5. (Optional) LaTeX distribution for report compilation
 sudo apt install -y texlive-latex-base texlive-latex-recommended texlive-fonts-recommended
+
+# From the repository root: use distro BCC bindings inside this venv
+sudo apt install -y python3-venv
+python3 -m venv --system-site-packages .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
 
 ---
@@ -130,19 +136,19 @@ sudo apt install -y texlive-latex-base texlive-latex-recommended texlive-fonts-r
 
 ### Step 1: Run Environment Preflight Checker
 ```bash
-python3 scripts/check_environment.py
+.venv/bin/python scripts/check_environment.py
 ```
 *Inspects kernel headers, BCC availability, tracepoint formats, CPU cores, and emits `results/environment_manifest.json`.*
 
 ### Step 2: Run Unit Test Suite
 ```bash
-python3 -m pytest tests -v
+.venv/bin/python -m pytest tests -v
 ```
 *Executes all 26 unit tests covering schema validation, interval union arithmetic, feature isolation, rule logic, and ML grouped splits.*
 
 ### Step 3: Run Smoke Test
 ```bash
-python3 scripts/smoke_test.py
+sudo .venv/bin/python scripts/smoke_test.py
 ```
 *Validates the full 5-stage pipeline: workload execution $\rightarrow$ event logging $\rightarrow$ correlation $\rightarrow$ feature extraction $\rightarrow$ rule classification.*
 
@@ -150,34 +156,44 @@ python3 scripts/smoke_test.py
 Execute the factorial evaluation matrix across workloads, concurrency levels, and repeated trials:
 ```bash
 # Quick profile (for debugging/smoke runs):
-sudo python3 scripts/run_experiments.py --profile quick
+sudo .venv/bin/python scripts/run_experiments.py --profile quick
 
 # Full evaluation profile (required for complete research submission):
-sudo python3 scripts/run_experiments.py --profile full
+sudo .venv/bin/python scripts/run_experiments.py --profile full
 ```
-Outputs are saved to `results/run_YYYYMMDD_HHMMSS_full/`:
+The full profile runs reads at 8 and 32 MiB in warm and best-effort cold-cache conditions, and synchronous writes at both sizes. Every condition runs at concurrency 1, 2, and 4 for five repetitions. Outputs are saved to `results/run_YYYYMMDD_HHMMSS_full/`:
 - `workload_runs.csv`: Operation timestamps and ground truth labels.
 - `raw_events.jsonl`: Complete eBPF event stream.
 - `features.csv`: Extracted quantitative feature vectors.
 - `predictions.csv`: Predictions from Fused, Baselines, and ML models.
-- `metrics.json`: Macro-F1, per-class PR, confusion matrices, and overhead.
+- `metrics.json`: Macro-F1, per-class PR, confusion matrices, overhead, process CPU time, the 10% overhead budget, high-confidence error diagnostics, and injected-sleep duration error.
 - `baseline_comparison.csv`: Comparative summary table.
+- `throughput_summary.csv`: Monitored and unmonitored I/O throughput, throughput change, and p99 operation latency by size/cache/concurrency condition.
+- `transfer_evaluation.csv`: Decision-tree evaluation with each file size held out from training.
+
+The duration-error reference is the configured intentional sleep interval. It validates blocked-time measurement and is not a ground-truth storage stall duration. `posix_fadvise` cache eviction is advisory, so cold-read results must be described with that limitation.
+
+After the full run, set the newest run directory once:
+
+```bash
+RUN_DIR=$(ls -dt results/run_*_full | head -n 1)
+```
 
 ### Step 5: Run Ablation Study
 ```bash
-python3 scripts/run_ablations.py results/run_<timestamp>_full/features.csv
+.venv/bin/python scripts/run_ablations.py "$RUN_DIR/features.csv"
 ```
 *Evaluates the contribution of individual layers by systematically ablating Block I/O, Scheduler, and Syscall signals.*
 
 ### Step 6: Generate Publication Figures
 ```bash
-python3 scripts/generate_figures.py results/run_<timestamp>_full
+.venv/bin/python scripts/generate_figures.py "$RUN_DIR"
 ```
-*Generates baseline comparisons, confusion matrices, overhead charts, and runnable wait boxplots in `figures/`.*
+*Generates baseline comparisons, confusion matrices, overhead charts, runnable-wait boxplots, and monitored/unmonitored throughput comparisons in `figures/`.*
 
 ### Step 7: Export LaTeX Tables and Compile Report
 ```bash
-python3 scripts/generate_report_data.py results/run_<timestamp>_full report
+.venv/bin/python scripts/generate_report_data.py "$RUN_DIR" report
 cd report
 pdflatex main.tex
 bibtex main
@@ -187,7 +203,7 @@ pdflatex main.tex
 
 ### Step 8: Package Submission Deliverables
 ```bash
-python3 scripts/package_submission.py
+.venv/bin/python scripts/package_submission.py
 ```
 *Validates repository integrity and produces:*
 - `deliverables/report-source.zip`

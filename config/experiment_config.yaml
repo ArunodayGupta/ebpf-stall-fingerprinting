@@ -18,6 +18,7 @@ workloads:
       sync_mode: "fsync"
       sleep_duration_ms: 100
       contention_worker_count: 2
+      io_file_sizes_mb: [8]
     full:
       concurrency_levels: [1, 2, 4]
       repetitions: 5
@@ -27,6 +28,10 @@ workloads:
       sync_mode: "fsync"
       sleep_duration_ms: 200
       contention_worker_count: 4
+      io_file_sizes_mb: [8, 32]
+  io_conditions:
+    # Cache states are best-effort interventions. File sizes vary by profile above.
+    read_cache_states: [cold, warm]
   workload_types:
     - cpu_bound
     - file_read_sequential
@@ -77,6 +82,7 @@ ml_classifier:
   random_state: 42
 
 evaluation:
+  max_overhead_percent: 10.0
   baselines:
     - syscall_only
     - block_only

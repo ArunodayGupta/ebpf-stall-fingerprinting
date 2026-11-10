@@ -1,123 +1,46 @@
-# Reproduction Guide: eBPF-Based Fingerprinting of I/O-Induced Application Stalls
+# Reproduction Guide
 
-This document provides exact, end-to-end instructions for reproducing the experiments, generating the classification tables, creating the figures, and compiling the IEEE research paper.
+Run from the repository root on Linux. The live collector needs BCC, matching kernel headers, and root or equivalent BPF capabilities. Do not run the real experiment with `--allow-synthetic-dev-only`.
 
----
-
-## 1. Prerequisites and Environment Setup
-
-### 1.1 Target Hardware & OS Requirements
-- **OS**: Linux kernel version 5.15 or newer with eBPF support enabled (recommended: Kali Linux 2024.x or Ubuntu 22.04 LTS / 24.04 LTS inside VirtualBox VM).
-- **Architecture**: x86_64
-- **Privileges**: Root privileges (`sudo`) or `CAP_BPF` / `CAP_SYS_ADMIN` capability.
-- **Hardware**: Minimum 4 CPU cores, 4 GB RAM, and 10 GB disk space.
-
-### 1.2 Package Dependencies
-Install the required kernel headers, BCC compilers, and Python packages:
+## Install
 
 ```bash
-# On Debian/Ubuntu/Kali:
 sudo apt update
-sudo apt install -y build-essential linux-headers-$(uname -r) \
-    bpfcc-tools python3-bpfcc python3-pip python3-dev texlive-latex-base texlive-latex-extra
-
-# Install project Python requirements:
-pip install -r requirements.txt
+sudo apt install -y build-essential linux-headers-$(uname -r) bpfcc-tools python3-bpfcc python3-venv python3-pip texlive-latex-base texlive-latex-recommended
+python3 -m venv --system-site-packages .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
 
----
-
-## 2. Step-by-Step Reproduction Workflow
-
-### Step 1: Preflight Environment Inspection
-Verify that kernel tracepoints, headers, and privileges are ready:
+## Run and collect
 
 ```bash
-python scripts/check_environment.py
+.venv/bin/python scripts/check_environment.py
+.venv/bin/python -m pytest tests -v
+sudo .venv/bin/python scripts/smoke_test.py
+sudo .venv/bin/python scripts/run_experiments.py --profile full
 ```
-*Expected output*: A diagnostic summary saved to `results/environment_manifest.json` indicating `can_run_real_ebpf: true`.
 
-### Step 2: Execute Smoke Test
-Run the end-to-end smoke test verifying event schemas, correlation, classifier rules, and live BPF attachment:
+The full profile runs five repetitions at concurrency 1, 2, and 4. Reads use 8 MiB and 32 MiB files with warm and best-effort cold-cache conditions. Synchronous writes use both sizes. `posix_fadvise(POSIX_FADV_DONTNEED)` is advisory; the cold-cache label describes the intervention, not a guaranteed cache miss.
+
+The runner creates `results/run_<timestamp>_full/` with raw events, workload labels and boundaries, extracted features and predictions, baseline metrics, a held-out file-size transfer evaluation, I/O throughput summaries, and the overhead budget result. The process CPU metric is measured per workload process. Stall-duration error uses the configured injected sleep duration only; it is not a storage-stall reference.
+
+## Ablations, figures, and paper
+
+After the run, set the run directory once and generate artifacts:
 
 ```bash
-sudo python scripts/smoke_test.py
+RUN_DIR=$(ls -dt results/run_*_full | head -n 1)
+.venv/bin/python scripts/run_ablations.py "$RUN_DIR/features.csv"
+.venv/bin/python scripts/generate_figures.py "$RUN_DIR"
+.venv/bin/python scripts/generate_report_data.py "$RUN_DIR" report
+(cd report && pdflatex main.tex && bibtex main && pdflatex main.tex && pdflatex main.tex)
 ```
-*Expected output*: All 6 pipeline stages report success, with events emitted and decoded from kernel perf buffers.
 
-### Step 3: Run Unit Test Suite
-Run the test suite across all modules:
+Generated metrics and tables are measurements from that host. The report deliberately avoids claiming that H1 or H2 passed before the run. H2 diagnostics include abstention coverage and high-confidence error rate; inspect example predictions before describing abstention as having prevented a particular error.
+
+To package source deliverables after review:
 
 ```bash
-pytest
+.venv/bin/python scripts/package_submission.py
 ```
-*Expected output*: All 26+ unit and regression tests pass.
-
-### Step 4: Execute Full Benchmark & Observability Matrix
-Run the reproducible experiment matrix across all 5 workload conditions (CPU, Read, Write, Sched-Contention, Sleep) and 3 concurrency levels (1, 2, 4 workers) with 3 repetitions:
-
-```bash
-# Run full experimental matrix with real eBPF tracing:
-sudo python scripts/run_experiments.py --profile full
-
-# Or for a rapid validation run:
-sudo python scripts/run_experiments.py --profile quick
-```
-*Expected output locations* (`results/run_<timestamp>_<profile>/`):
-- `raw_events.jsonl`: Complete, unfiltered eBPF kernel event stream.
-- `workload_runs.csv`: Operation boundaries, PIDs, and ground-truth intervention labels.
-- `features.csv`: Extracted quantitative feature matrix across all workload windows.
-- `predictions.csv`: Model predictions across fused classifier and single-source baselines.
-- `test_predictions.csv`: Strictly held-out test split predictions for the decision tree.
-- `baseline_comparison.csv`: Comparative evaluation matrix across all models.
-- `metrics.json`: Detailed classification scores, Macro-F1, per-class F1, and probe overhead.
-
-### Step 5: Run Extended Ablations
-Execute the multi-dimensional ablation study (telemetry layers, time-window sizes, and block attribution):
-
-```bash
-python scripts/run_ablations.py results/run_<timestamp>_<profile>/features.csv
-```
-*Expected output*: `results/run_<timestamp>_<profile>/ablation_study.csv` summarizing performance drops under ablated conditions.
-
-### Step 6: Generate Figures & Report Tables
-Generate publication-ready figures and LaTeX tables directly from measured experimental data:
-
-```bash
-# Generate figures (confusion matrix, ROC, overhead bars):
-python scripts/generate_figures.py results/run_<timestamp>_<profile>
-
-# Generate LaTeX tables and macros for the paper:
-python scripts/generate_report_data.py results/run_<timestamp>_<profile> report/
-```
-*Expected output*:
-- `report/figures/confusion_matrix.png`
-- `report/figures/overhead_comparison.png`
-- `report/tables/baseline_table.tex`
-- `report/tables/overhead_table.tex`
-- `report/macros.tex`
-
-### Step 7: Compile Research Report PDF
-Compile the IEEE-format short paper:
-
-```bash
-cd report
-pdflatex main.tex
-bibtex main
-pdflatex main.tex
-pdflatex main.tex
-```
-*Expected output*: `report/main.pdf` compiled cleanly without missing references or unresolved macros.
-
----
-
-## 3. Package Deliverables Verification
-To regenerate all project submission archives:
-
-```bash
-python scripts/package_submission.py
-```
-This generates:
-- `deliverables/report-source.zip`: LaTeX paper sources, BibTeX, figures, and tables.
-- `deliverables/project-source.zip`: Complete, clean source code, tests, and configurations.
-- `deliverables/REPRODUCTION.md`: This execution guide.

@@ -19,6 +19,8 @@ def generate_latex_tables(results_dir: Path, report_dir: Path):
     metrics_file = results_dir / "metrics.json"
     comparison_file = results_dir / "baseline_comparison.csv"
     macros_file = report_dir / "macros.tex"
+    throughput_file = results_dir / "throughput_summary.csv"
+    transfer_file = results_dir / "transfer_evaluation.csv"
 
     if not metrics_file.exists() or not comparison_file.exists():
         print(f"Metrics not found in {results_dir}. Generating placeholder tables.")
@@ -93,6 +95,50 @@ def generate_latex_tables(results_dir: Path, report_dir: Path):
     ]
     with open(tables_dir / "overhead_table.tex", "w", encoding="utf-8") as f:
         f.write("\n".join(ov_lines) + "\n")
+
+    cpu_un = metrics.get("unmonitored_process_cpu", {})
+    cpu_mon = metrics.get("monitored_process_cpu", {})
+    stall_est = metrics.get("stall_duration_estimation", {})
+    budget = metrics.get("predeclared_overhead_budget", {})
+    extra_lines = [
+        r"\begin{table}[t]", r"\centering", r"\caption{CPU Use and Declared Overhead Budget}",
+        r"\label{tab:cpu_budget}", r"\begin{tabular}{lc}", r"\hline",
+        r"\textbf{Metric} & \textbf{Measured} \\", r"\hline",
+        f"Unmonitored process CPU (\\% of one core) & {cpu_un.get('mean_cpu_percent_of_one_core', 0):.2f} \\\\",
+        f"Monitored process CPU (\\% of one core) & {cpu_mon.get('mean_cpu_percent_of_one_core', 0):.2f} \\\\",
+        f"CPU use change (percentage points) & {metrics.get('process_cpu_overhead', {}).get('delta_percentage_points', 0):.2f} \\\\",
+        f"Overhead budget & {budget.get('maximum_percent', 0):.1f}\\% ({'PASS' if budget.get('within_budget') else 'EXCEEDS'}) \\\\",
+        f"Injected sleep duration MAE & {stall_est.get('mae_ms') if stall_est.get('mae_ms') is not None else 'N/A'} ms \\\\",
+        r"\hline", r"\end{tabular}", r"\end{table}",
+    ]
+    with open(tables_dir / "cpu_and_budget_table.tex", "w", encoding="utf-8") as f:
+        f.write("\n".join(extra_lines) + "\n")
+
+    if throughput_file.exists():
+        throughput = pd.read_csv(throughput_file)
+        lines = [r"\begin{table}[t]", r"\centering", r"\caption{Measured I/O Throughput by Workload Condition}",
+                 r"\label{tab:throughput}", r"\begin{tabular}{lrrr}", r"\hline",
+                 r"\textbf{Condition} & \textbf{N} & \textbf{Mean MiB/s} & \textbf{p99 ms} \\", r"\hline"]
+        for _, row in throughput.iterrows():
+            if row.get("workload_type") not in ("file_read_sequential", "file_write_sync"):
+                continue
+            cond = f"{row['workload_type']} {row.get('cache_state', '')} {row.get('file_size_mb', '')}MB"
+            lines.append(f"{cond} & {int(row['samples'])} & {row['mean_mib_s']:.2f} & {row['p99_latency_ms']:.2f} \\\\")
+        lines.extend([r"\hline", r"\end{tabular}", r"\end{table}"])
+        with open(tables_dir / "throughput_table.tex", "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+    if transfer_file.exists():
+        transfer = pd.read_csv(transfer_file)
+        lines = [r"\begin{table}[t]", r"\centering", r"\caption{Decision Tree Transfer to Held-Out I/O File Sizes}",
+                 r"\label{tab:transfer}", r"\begin{tabular}{lrrl}", r"\hline",
+                 r"\textbf{Held-Out Size} & \textbf{N} & \textbf{Macro-F1} & \textbf{Status} \\", r"\hline"]
+        for _, row in transfer.iterrows():
+            f1 = f"{row['macro_f1']:.3f}" if pd.notna(row.get("macro_f1")) else "N/A"
+            lines.append(f"{row['held_out_file_size_mb']} MB & {int(row['total_samples'])} & {f1} & {row['status']} \\\\")
+        lines.extend([r"\hline", r"\end{tabular}", r"\end{table}"])
+        with open(tables_dir / "transfer_table.tex", "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
 
     # 3. Export LaTeX Macros
     fused_m = metrics.get("fused_rule_classifier", {})

@@ -19,6 +19,7 @@ import json
 import yaml
 from pathlib import Path
 from datetime import datetime
+import numpy as np
 import pandas as pd
 
 # Ensure src and root are in sys.path
@@ -41,7 +42,10 @@ from stall_fingerprint.baselines import (
     SchedulerOnlyClassifier,
 )
 from stall_fingerprint.classifier_ml import LightweightMLClassifier
-from stall_fingerprint.evaluation import compute_classification_metrics, compute_overhead_metrics
+from stall_fingerprint.evaluation import (
+    compute_classification_metrics, compute_overhead_metrics,
+    compute_cpu_usage_metrics, compute_stall_duration_error, compute_confidence_metrics,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("run_experiments")
@@ -52,6 +56,20 @@ def load_config(config_path: Path) -> dict:
         return {}
     with open(config_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+def workload_scenarios(workload_type: str, profile: dict, config: dict):
+    """Expand reproducible I/O transfer/cache conditions; non-I/O jobs run once."""
+    io_cfg = config.get("workloads", {}).get("io_conditions", {})
+    sizes = profile.get("io_file_sizes_mb", io_cfg.get("file_sizes_mb", [profile.get("file_size_mb", 32)]))
+    if workload_type == "file_read_sequential":
+        cache_states = io_cfg.get("read_cache_states", ["cold", "warm"])
+        return [
+            (f"{state}_{size}mb", {**profile, "file_size_mb": size, "cold_cache": state == "cold"})
+            for size in sizes for state in cache_states
+        ]
+    if workload_type == "file_write_sync":
+        return [(f"sync_{size}mb", {**profile, "file_size_mb": size}) for size in sizes]
+    return [("default", profile)]
 
 def run_experiment_matrix(
     profile_name: str,
@@ -97,6 +115,8 @@ def run_experiment_matrix(
         "concurrency_levels": concurrency_levels,
         "repetitions": repetitions,
         "profile_params": profile,
+        "io_conditions": config.get("workloads", {}).get("io_conditions", {}),
+        "expanded_scenarios": [],
         "allow_synthetic": allow_synthetic,
     }
     with open(output_dir / "run_config.json", "w", encoding="utf-8") as f:
@@ -127,36 +147,59 @@ def run_experiment_matrix(
     raw_events_path = output_dir / "raw_events.jsonl"
 
     all_op_records = []
-    unmonitored_durations_map = {w: [] for w in workload_types}
-    monitored_durations_map = {w: [] for w in workload_types}
+    unmonitored_durations_map = {}
+    monitored_durations_map = {}
+    unmonitored_cpu_map = {}
+    monitored_cpu_map = {}
+    unmonitored_throughput_map = {}
+    monitored_throughput_map = {}
+
+    scenarios = [
+        (w, scenario_name, scenario_params)
+        for w in workload_types
+        for scenario_name, scenario_params in workload_scenarios(w, profile, config)
+    ]
+    run_meta["expanded_scenarios"] = [f"{w}:{name}" for w, name, _ in scenarios]
+    with open(output_dir / "run_config.json", "w", encoding="utf-8") as f:
+        json.dump(run_meta, f, indent=2)
 
     # 1. Measure Unmonitored Baselines (Performance Control)
     logger.info("--- Phase 1: Measuring Unmonitored Baseline Workloads (Control) ---")
-    for w_type in workload_types:
-        for rep in range(min(repetitions, 3)):
-            trial_id = f"unmon_{w_type}_c1_r{rep}"
-            try:
-                recs = supervisor.execute_workload_trial(
-                    workload_type=w_type,
-                    trial_id=trial_id,
-                    concurrency=1,
-                    params=profile,
-                    register_pid_fn=None,
-                )
-                for r in recs:
-                    unmonitored_durations_map[w_type].append(r.duration_ns / 1_000_000)
-            except Exception as e:
-                logger.warning(f"Unmonitored run failed for {w_type}: {e}")
+    for w_type, scenario_name, scenario_params in scenarios:
+        for conc in concurrency_levels:
+            for rep in range(repetitions):
+                trial_id = f"unmon_{w_type}_{scenario_name}_c{conc}_r{rep}"
+                try:
+                    recs = supervisor.execute_workload_trial(
+                        workload_type=w_type,
+                        trial_id=trial_id,
+                        concurrency=conc,
+                        params=scenario_params,
+                        register_pid_fn=None,
+                    )
+                    for r in recs:
+                        key = f"{w_type}|{scenario_name}|c{conc}"
+                        unmonitored_durations_map.setdefault(key, []).append(r.duration_ns / 1_000_000)
+                        unmonitored_cpu_map.setdefault(key, []).append(
+                            int(r.parameters.get("process_cpu_ns", 0)) / 1_000_000
+                        )
+                        byte_count = int(r.parameters.get("total_bytes_read", r.parameters.get("bytes_written", 0)) or 0)
+                        if byte_count:
+                            unmonitored_throughput_map.setdefault(key, []).append(
+                                (byte_count / (1024 * 1024)) / (r.duration_ns / 1_000_000_000)
+                            )
+                except Exception as e:
+                    logger.warning(f"Unmonitored run failed for {w_type}: {e}")
 
     # 2. Measure Monitored Workloads with eBPF Tracing
     logger.info("--- Phase 2: Executing Monitored Tracing Workloads ---")
     total_dropped_events = 0
 
     with EventWriter(raw_events_path) as event_writer:
-        for w_type in workload_types:
+        for w_type, scenario_name, scenario_params in scenarios:
             for conc in concurrency_levels:
                 for rep in range(repetitions):
-                    trial_id = f"trial_{w_type}_c{conc}_r{rep}"
+                    trial_id = f"trial_{w_type}_{scenario_name}_c{conc}_r{rep}"
                     logger.info(f"Running trial: {trial_id}")
 
                     collector = None
@@ -183,12 +226,21 @@ def run_experiment_matrix(
                             workload_type=w_type,
                             trial_id=trial_id,
                             concurrency=conc,
-                            params=profile,
+                            params=scenario_params,
                             register_pid_fn=reg_fn,
                         )
                         # Record inner workload duration for honest, like-for-like comparison
                         for r in recs:
-                            monitored_durations_map[w_type].append(r.duration_ns / 1_000_000)
+                            key = f"{w_type}|{scenario_name}|c{conc}"
+                            monitored_durations_map.setdefault(key, []).append(r.duration_ns / 1_000_000)
+                            monitored_cpu_map.setdefault(key, []).append(
+                                int(r.parameters.get("process_cpu_ns", 0)) / 1_000_000
+                            )
+                            byte_count = int(r.parameters.get("total_bytes_read", r.parameters.get("bytes_written", 0)) or 0)
+                            if byte_count:
+                                monitored_throughput_map.setdefault(key, []).append(
+                                    (byte_count / (1024 * 1024)) / (r.duration_ns / 1_000_000_000)
+                                )
                         all_op_records.extend(recs)
                     except Exception as e:
                         logger.error(f"Workload {trial_id} failed: {e}")
@@ -229,6 +281,8 @@ def run_experiment_matrix(
     preds, exps = rule_classifier.predict_dataframe(features_df)
     features_df["predicted_rule_fused"] = preds
     features_df["rule_explanation"] = exps
+    rule_confidences = [rule_classifier.predict_sample(row.to_dict()).confidence for _, row in features_df.iterrows()]
+    features_df["rule_confidence"] = rule_confidences
 
     # 6. Evaluate Single-Source Baselines
     logger.info("--- Phase 6: Evaluating Single-Source Baselines ---")
@@ -302,6 +356,64 @@ def run_experiment_matrix(
             "indeterminate_f1": m["per_class"].get("indeterminate", {}).get("f1", 0.0),
         })
 
+    all_metrics["fused_confidence"] = compute_confidence_metrics(y_true, preds, rule_confidences)
+    all_metrics["stall_duration_estimation"] = compute_stall_duration_error(features_df)
+    if not features_df.empty:
+        io_features_df = features_df[features_df["workload_type"].isin(["file_read_sequential", "file_write_sync"])]
+        throughput_summary = (
+            io_features_df.groupby(["workload_type", "file_size_mb", "cache_state", "concurrency"], dropna=False)
+            .agg(samples=("trial_id", "count"), monitored_mean_mib_s=("throughput_mib_s", "mean"),
+                 monitored_p50_mib_s=("throughput_mib_s", "median"), monitored_p99_latency_ms=("wall_duration_ms", lambda x: x.quantile(0.99)))
+            .reset_index()
+        )
+        control_rates = []
+        for _, row in throughput_summary.iterrows():
+            workload = row["workload_type"]
+            size = int(row["file_size_mb"])
+            cache = row["cache_state"]
+            concurrency = int(row["concurrency"])
+            scenario = f"{cache}_{size}mb" if workload == "file_read_sequential" else f"sync_{size}mb"
+            all_rates = [
+                rate for key, rates in unmonitored_throughput_map.items()
+                if key == f"{workload}|{scenario}|c{concurrency}" for rate in rates
+            ]
+            condition_key = f"{workload}|{scenario}|c{concurrency}"
+            control_durations = unmonitored_durations_map.get(condition_key, [])
+            baseline_rate = float(np.mean(all_rates)) if all_rates else float("nan")
+            monitored_rate = float(row["monitored_mean_mib_s"])
+            delta = ((monitored_rate - baseline_rate) / baseline_rate * 100.0) if baseline_rate > 0 else float("nan")
+            baseline_p99 = float(np.percentile(control_durations, 99)) if control_durations else float("nan")
+            monitor_p99 = float(row["monitored_p99_latency_ms"])
+            p99_delta = monitor_p99 - baseline_p99 if np.isfinite(baseline_p99) else float("nan")
+            control_rates.append((baseline_rate, delta, baseline_p99, p99_delta))
+        throughput_summary["unmonitored_mean_mib_s"] = [x[0] for x in control_rates]
+        throughput_summary["throughput_change_percent"] = [x[1] for x in control_rates]
+        throughput_summary["unmonitored_p99_latency_ms"] = [x[2] for x in control_rates]
+        throughput_summary["p99_latency_change_ms"] = [x[3] for x in control_rates]
+        # Keep the report generator's established column name for monitored throughput.
+        throughput_summary["mean_mib_s"] = throughput_summary["monitored_mean_mib_s"]
+        throughput_summary["p99_latency_ms"] = throughput_summary["monitored_p99_latency_ms"]
+        throughput_summary.to_csv(output_dir / "throughput_summary.csv", index=False)
+
+    # Size-transfer evaluation: hold out each I/O file size, train on all other
+    # operations (including other classes), and evaluate only I/O at the held-out size.
+    transfer_rows = []
+    io_rows = features_df[features_df["workload_type"].isin(["file_read_sequential", "file_write_sync"])].dropna(subset=["file_size_mb"])
+    for held_out_size in sorted(io_rows["file_size_mb"].unique()):
+        test_mask = io_rows["file_size_mb"] == held_out_size
+        test_df = io_rows[test_mask].copy()
+        train_df = features_df[features_df["file_size_mb"].isna() | (features_df["file_size_mb"] != held_out_size)].copy()
+        transfer_model = LightweightMLClassifier(max_depth=3, random_state=42)
+        fitted = transfer_model.fit(train_df, target_col="expected_label")
+        if fitted and not test_df.empty:
+            transfer_metrics = compute_classification_metrics(test_df["expected_label"].tolist(), transfer_model.predict(test_df))
+            transfer_rows.append({"held_out_file_size_mb": held_out_size, "status": "evaluated", **{
+                k: transfer_metrics[k] for k in ("total_samples", "macro_f1", "overall_accuracy", "coverage", "abstention_rate")
+            }})
+        else:
+            transfer_rows.append({"held_out_file_size_mb": held_out_size, "status": "insufficient_training_data", "total_samples": len(test_df)})
+    pd.DataFrame(transfer_rows).to_csv(output_dir / "transfer_evaluation.csv", index=False)
+
     # Add Decision Tree metrics evaluated strictly on held-out test data
     if ml_fitted and ml_test_metrics:
         all_metrics["ml_decision_tree"] = ml_test_metrics
@@ -327,15 +439,54 @@ def run_experiment_matrix(
     flat_mon = [v for sub in monitored_durations_map.values() for v in sub]
     overhead_res = compute_overhead_metrics(flat_unmon, flat_mon, total_events=len(all_events), dropped_events=total_dropped_events)
     all_metrics["instrumentation_overhead"] = overhead_res
+    max_overhead = config.get("evaluation", {}).get("max_overhead_percent", 10.0)
+    all_metrics["predeclared_overhead_budget"] = {
+        "maximum_percent": max_overhead,
+        "measured_percent": overhead_res["overhead_percent"],
+        "within_budget": overhead_res["overhead_percent"] <= max_overhead,
+    }
+    unmon_cpu_pairs = [
+        (cpu, wall)
+        for key in sorted(set(unmonitored_cpu_map) & set(unmonitored_durations_map))
+        for cpu, wall in zip(unmonitored_cpu_map[key], unmonitored_durations_map[key])
+    ]
+    mon_cpu_pairs = [
+        (cpu, wall)
+        for key in sorted(set(monitored_cpu_map) & set(monitored_durations_map))
+        for cpu, wall in zip(monitored_cpu_map[key], monitored_durations_map[key])
+    ]
+    all_metrics["unmonitored_process_cpu"] = compute_cpu_usage_metrics(
+        [p[0] for p in unmon_cpu_pairs], [p[1] for p in unmon_cpu_pairs]
+    )
+    all_metrics["monitored_process_cpu"] = compute_cpu_usage_metrics(
+        [p[0] for p in mon_cpu_pairs], [p[1] for p in mon_cpu_pairs]
+    )
+    cpu_un_pct = all_metrics["unmonitored_process_cpu"]["mean_cpu_percent_of_one_core"]
+    cpu_mon_pct = all_metrics["monitored_process_cpu"]["mean_cpu_percent_of_one_core"]
+    all_metrics["process_cpu_overhead"] = {
+        "delta_percentage_points": round(cpu_mon_pct - cpu_un_pct, 2),
+        "relative_percent": round((cpu_mon_pct - cpu_un_pct) / cpu_un_pct * 100.0, 2) if cpu_un_pct > 0 else None,
+    }
 
     # Per-workload overhead breakdown
     per_workload_overhead = {}
-    for w in workload_types:
-        u_sub = unmonitored_durations_map.get(w, [])
-        m_sub = monitored_durations_map.get(w, [])
+    for key in sorted(set(unmonitored_durations_map) & set(monitored_durations_map)):
+        u_sub = unmonitored_durations_map.get(key, [])
+        m_sub = monitored_durations_map.get(key, [])
         if u_sub and m_sub:
-            per_workload_overhead[w] = compute_overhead_metrics(u_sub, m_sub, total_events=0, dropped_events=0)
+            per_workload_overhead[key] = compute_overhead_metrics(u_sub, m_sub, total_events=0, dropped_events=0)
     all_metrics["per_workload_overhead"] = per_workload_overhead
+
+    single_layer_f1 = [
+        all_metrics.get(k, {}).get("macro_f1", 0.0)
+        for k in ("baseline_syscall_only", "baseline_block_only", "baseline_sched_only")
+    ]
+    all_metrics["success_criteria"] = {
+        "h1_fusion_beats_best_single_layer": all_metrics.get("fused_rule_classifier", {}).get("macro_f1", 0.0) > max(single_layer_f1, default=0.0),
+        "overhead_budget_met": all_metrics["predeclared_overhead_budget"]["within_budget"],
+        "overhead_budget_percent": max_overhead,
+        "h2_reported_as_diagnostics": "fused_confidence and abstention metrics; inspect examples before claiming abstention prevented errors",
+    }
 
     with open(output_dir / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(all_metrics, f, indent=2)

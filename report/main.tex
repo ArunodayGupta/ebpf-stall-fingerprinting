@@ -27,7 +27,7 @@ Assignment 3 Submission Artifact}
 \maketitle
 
 \begin{abstract}
-Application latency stalls frequently degrade modern software performance, yet determining whether a transient stall originates from physical storage I/O, CPU scheduling starvation, or user-space/syscall execution remains challenging. Traditional observability frameworks inspect system call latencies, block-layer requests, or scheduler transitions in isolation, frequently conflating voluntary task sleeps with runnable queue delays or assuming that nearby block operations caused a delayed syscall. This paper presents an end-to-end Linux kernel observability framework that fingerprints application stalls using Extended Berkeley Packet Filter (eBPF) technology. By deploying in-kernel probes at system call, block I/O, and scheduler tracepoints, our system captures microsecond-scale execution intervals while enforcing strict process-level scoping via BPF hash maps. We introduce an interval-union correlation engine that prevents double-counting of overlapping events, and implement a transparent rule-based classifier that outputs one of four explicit states: \textit{io\_wait\_dominated}, \textit{scheduler\_wait\_dominated}, \textit{cpu\_syscall\_dominated}, or an explicit \textit{indeterminate} abstention class. We evaluate the system against single-source baselines and a lightweight decision tree across five controlled workload conditions and three concurrency levels. Our findings confirm that fusing multi-layer telemetry significantly reduces false attributions under ambiguous cache and preemption states while maintaining low runtime probe overhead.
+Application latency stalls can arise from storage waits, scheduler delay, or CPU and syscall work. This paper presents a reproducible Linux eBPF framework that correlates syscall, block-layer, and scheduler events over controlled operation windows. It uses interval-union accounting and a four-class rule classifier with an explicit \textit{indeterminate} outcome. The repository includes controlled workloads, single-source baselines, a grouped decision-tree evaluation, cache and file-size transfer conditions, and scripts for measuring classification quality, throughput, latency, process CPU use, event loss, and injected-sleep duration error. Quantitative conclusions are intentionally generated from the user's target Linux runs; the report tables are populated from those measurements.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -159,24 +159,21 @@ Table~\ref{tab:baseline_comparison} presents the comparative evaluation across s
 
 \input{tables/baseline_table.tex}
 
-The experimental protocol is designed to test Hypothesis H1 and H2 across the controlled workload matrix. Preliminary pipeline tests indicate that single-source baselines exhibit fundamental diagnostic blind spots: the Syscall-Only baseline cannot distinguish off-CPU scheduler contention from CPU execution, while the Block-Only baseline fails to observe CPU or scheduler activity. In contrast, the Fused Rule Classifier combines signals across all layers to provide unified attribution.
-
-Hypothesis H2 is tested by evaluating the negative-control sleep workload and cached reads: by providing an explicit \textit{indeterminate} class, the model abstains rather than producing high-confidence false attributions. Final quantitative metrics for the target Kali Linux environment will be populated directly upon execution via \texttt{generate\_report\_data.py}.
+The experiment runner evaluates H1 by comparing the fused rule classifier with syscall-only, block-only, and scheduler-only baselines. It reports H2 diagnostics through abstention coverage and the error rate among high-confidence, non-abstained predictions. These measurements do not constitute a counterfactual proof that every abstention prevented an error; ambiguous examples and their labels must be inspected alongside the aggregate metrics. Final quantitative results are generated from the target Linux run by \texttt{generate\_report\_data.py}.
 
 \subsection{Instrumentation Overhead and Latency Profile}
 Table~\ref{tab:overhead_profile} details the runtime overhead induced by eBPF instrumentation, comparing unmonitored baseline workloads against monitored executions.
 
 \input{tables/overhead_table.tex}
 
+\IfFileExists{tables/cpu_and_budget_table.tex}{\input{tables/cpu_and_budget_table.tex}}{}
+\IfFileExists{tables/throughput_table.tex}{\input{tables/throughput_table.tex}}{}
+\IfFileExists{tables/transfer_table.tex}{\input{tables/transfer_table.tex}}{}
+
 The measurement harness computes like-for-like overhead across identical workload conditions. In-kernel filtering via the \texttt{target\_pids} map ensures that unmonitored system activity incurs minimal probe evaluation overhead. Buffer overflow diagnostics and lost event callbacks are tracked to ensure that any trial exceeding the configured drop threshold is flagged as indeterminate.
 
 \section{Ablation Study and Robustness}
-We systematically ablate individual telemetry sources from the fused classifier:
-\begin{itemize}
-    \item \textbf{No Block I/O}: Eliminating block-layer events causes cached file reads to be falsely classified as physical I/O stalls, degrading precision on \textit{io\_wait\_dominated}.
-    \item \textbf{No Scheduler Telemetry}: Removing scheduler transitions prevents the system from detecting runqueue starvation under Workload D, collapsing scheduler Macro-F1 to 0.
-    \item \textbf{No Syscall Durations}: Removing syscall durations eliminates the boundary between storage calls and user-space computation.
-\end{itemize}
+The ablation runner reports the measured effect of removing each telemetry layer, changing the correlation window, and using PID-attributed versus all-window block events. The full experiment also holds out each configured I/O file size when training the decision tree and evaluates the model on that size. Cold-cache advice is advisory; cache state and storage behavior must be interpreted from the recorded environment and telemetry rather than treated as guaranteed cache eviction.
 
 \section{Threats to Validity and Limitations}
 \begin{itemize}
@@ -189,7 +186,7 @@ We systematically ablate individual telemetry sources from the fused classifier:
 Our telemetry collection adheres to strict privacy safeguards: no user payloads, file contents, memory data, or credentials are intercepted. Telemetry is restricted to monotonic timestamps, return codes, byte counts, and task scheduling transitions.
 
 \section{Conclusion}
-This paper demonstrates that robust fingerprinting of application stalls requires fusing telemetry across system calls, block I/O, and the scheduler. By combining in-kernel BPF filtering, non-overlapping interval union correlation, and an explicit abstention class, our framework accurately identifies the root causes of latency stalls while explicitly flagging unprovable attributions with low probe overhead.
+This work provides a reproducible framework for testing whether fused syscall, block, and scheduler telemetry improves stall classification under controlled interventions. The measured accuracy, abstention behavior, transfer performance, and instrumentation cost depend on the target kernel and storage setup. The generated tables and recorded limitations should be used to state whether the hypotheses and the predeclared overhead budget were met.
 
 \bibliographystyle{IEEEtran}
 \bibliography{references}

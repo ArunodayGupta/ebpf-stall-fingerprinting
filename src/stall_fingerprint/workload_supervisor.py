@@ -69,7 +69,9 @@ def _worker_process_entry(
         ready_queue.put(pid)
         # Block until supervisor has registered PID in kernel BPF map
         start_event.wait()
+        cpu_start_ns = time.process_time_ns()
         rec = _dispatch_single_workload(workload_type, worker_trial_id, concurrency, params)
+        rec.parameters["process_cpu_ns"] = time.process_time_ns() - cpu_start_ns
         rec.parent_trial_id = parent_trial_id
         result_queue.put((True, rec))
     except Exception as e:
@@ -97,7 +99,9 @@ class WorkloadSupervisor:
         if concurrency == 1:
             if register_pid_fn:
                 register_pid_fn(os.getpid())
+            cpu_start_ns = time.process_time_ns()
             rec = _dispatch_single_workload(workload_type, trial_id, concurrency, p_params)
+            rec.parameters["process_cpu_ns"] = time.process_time_ns() - cpu_start_ns
             rec.parent_trial_id = trial_id
             records.append(rec)
         else:

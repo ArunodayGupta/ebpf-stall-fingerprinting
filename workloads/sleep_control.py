@@ -40,7 +40,12 @@ def run_sleep_workload(
         intervention_label="intentional_sleep",
         expected_label="indeterminate",
         concurrency=concurrency,
-        parameters={"sleep_duration_ms": sleep_duration_ms},
+        parameters={
+            "sleep_duration_ms": sleep_duration_ms,
+            # Known injected wait used to quantify blocked-time estimation error.
+            "reference_stall_duration_ns": int(sleep_duration_ms * 1_000_000),
+            "reference_stall_source": "configured_sleep_duration",
+        },
     )
 
 if __name__ == "__main__":

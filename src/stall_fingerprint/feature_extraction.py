@@ -15,6 +15,9 @@ def extract_features_from_correlated_window(cw: WindowCorrelatedEvents) -> Dict[
     parent_trial_id = getattr(op, "parent_trial_id", op.trial_id)
     if not parent_trial_id:
         parent_trial_id = op.trial_id.split("_worker_")[0] if "_worker_" in op.trial_id else op.trial_id
+    params = getattr(op, "parameters", {}) or {}
+    bytes_processed = int(params.get("total_bytes_read", params.get("bytes_written", 0)) or 0)
+    throughput_mib_s = (bytes_processed / (1024 * 1024)) / (wall_duration_ns / 1_000_000_000)
 
     # --- 1. Syscall Layer Features ---
     storage_syscall_intervals = []
@@ -181,6 +184,17 @@ def extract_features_from_correlated_window(cw: WindowCorrelatedEvents) -> Dict[
         "end_ns": op.end_ns,
         "wall_duration_ns": wall_duration_ns,
         "wall_duration_ms": round(wall_duration_ns / 1_000_000, 3),
+        "file_size_mb": params.get("file_size_mb"),
+        "cache_state": params.get("cache_state", "not_applicable"),
+        "chunk_size_kb": params.get("chunk_size_kb"),
+        "bytes_processed": bytes_processed,
+        "throughput_mib_s": round(throughput_mib_s, 4),
+        "process_cpu_ns": int(params.get("process_cpu_ns", 0) or 0),
+        "process_cpu_percent_of_one_core": round(
+            100.0 * int(params.get("process_cpu_ns", 0) or 0) / wall_duration_ns, 2
+        ),
+        "reference_stall_duration_ns": params.get("reference_stall_duration_ns"),
+        "reference_stall_source": params.get("reference_stall_source"),
 
         # Syscall features
         "syscall_count": storage_syscall_count,

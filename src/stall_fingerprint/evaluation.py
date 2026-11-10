@@ -136,3 +136,45 @@ def compute_overhead_metrics(
         "dropped_events": dropped_events,
         "dropped_event_rate": round(dropped_rate, 4),
     }
+
+def compute_cpu_usage_metrics(cpu_time_ms: List[float], wall_time_ms: List[float]) -> Dict[str, Any]:
+    """Summarize workload process CPU time; utilization may exceed 100% for parallel tasks."""
+    pairs = [(max(float(c), 0.0), max(float(w), 0.0)) for c, w in zip(cpu_time_ms, wall_time_ms) if w > 0]
+    if not pairs:
+        return {"samples": 0, "mean_cpu_time_ms": 0.0, "mean_cpu_percent_of_one_core": 0.0}
+    cpu = np.array([p[0] for p in pairs])
+    utilization = np.array([100.0 * p[0] / p[1] for p in pairs])
+    return {
+        "samples": len(pairs),
+        "mean_cpu_time_ms": round(float(np.mean(cpu)), 2),
+        "mean_cpu_percent_of_one_core": round(float(np.mean(utilization)), 2),
+    }
+
+def compute_stall_duration_error(features_df: pd.DataFrame) -> Dict[str, Any]:
+    """Compare scheduler blocked-time estimates with known injected sleep durations only."""
+    if features_df.empty or "reference_stall_duration_ns" not in features_df:
+        return {"reference": "none", "samples": 0, "mae_ms": None, "p95_absolute_error_ms": None}
+    rows = features_df.dropna(subset=["reference_stall_duration_ns"])
+    if rows.empty:
+        return {"reference": "none", "samples": 0, "mae_ms": None, "p95_absolute_error_ms": None}
+    errors_ms = np.abs(
+        rows["off_cpu_blocked_ns"].astype(float).to_numpy()
+        - rows["reference_stall_duration_ns"].astype(float).to_numpy()
+    ) / 1_000_000.0
+    return {
+        "reference": "configured intentional sleep duration; not an I/O ground-truth duration",
+        "samples": int(len(errors_ms)),
+        "mae_ms": round(float(np.mean(errors_ms)), 3),
+        "p95_absolute_error_ms": round(float(np.percentile(errors_ms, 95)), 3),
+    }
+
+def compute_confidence_metrics(y_true: List[str], y_pred: List[str], confidences: List[float], threshold: float = 0.75) -> Dict[str, Any]:
+    """Report error among high-confidence non-abstaining decisions and their coverage."""
+    selected = [i for i, (pred, conf) in enumerate(zip(y_pred, confidences)) if pred != LABEL_INDETERMINATE and conf >= threshold]
+    errors = sum(y_true[i] != y_pred[i] for i in selected)
+    return {
+        "confidence_threshold": threshold,
+        "high_confidence_non_abstained_samples": len(selected),
+        "high_confidence_non_abstained_coverage": round(len(selected) / len(y_true), 4) if y_true else 0.0,
+        "high_confidence_non_abstained_error_rate": round(errors / len(selected), 4) if selected else None,
+    }

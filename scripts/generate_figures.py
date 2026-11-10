@@ -187,12 +187,43 @@ def plot_runnable_wait(features_csv: Path, out_dir: Path):
     plt.close()
     print(f"Saved: {out_file}")
 
+def plot_throughput(throughput_csv: Path, out_dir: Path):
+    if not throughput_csv.exists():
+        return
+    df = pd.read_csv(throughput_csv)
+    if df.empty or "unmonitored_mean_mib_s" not in df.columns:
+        return
+    df = df[df["workload_type"].isin(["file_read_sequential", "file_write_sync"])].copy()
+    df = df.dropna(subset=["unmonitored_mean_mib_s", "monitored_mean_mib_s"])
+    if df.empty:
+        return
+    df["condition"] = df.apply(
+        lambda r: f"{r['workload_type'].replace('file_', '')}\n{r['cache_state']} {int(r['file_size_mb'])}MB C{int(r['concurrency'])}",
+        axis=1,
+    )
+    x = np.arange(len(df))
+    width = 0.38
+    fig, ax = plt.subplots(figsize=(max(9, len(df) * 0.55), 5))
+    ax.bar(x - width / 2, df["unmonitored_mean_mib_s"], width, label="Unmonitored", color="#7f7f7f")
+    ax.bar(x + width / 2, df["monitored_mean_mib_s"], width, label="eBPF monitored", color="#1f77b4")
+    ax.set_ylabel("Throughput (MiB/s)")
+    ax.set_title("I/O Throughput with and without eBPF tracing")
+    ax.set_xticks(x)
+    ax.set_xticklabels(df["condition"], rotation=35, ha="right")
+    ax.legend()
+    ax.grid(axis="y", linestyle="--", alpha=0.6)
+    out_file = out_dir / "throughput_comparison.png"
+    plt.savefig(out_file, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Saved: {out_file}")
+
 def generate_all_figures(results_dir: Path, figures_dir: Path):
     figures_dir.mkdir(parents=True, exist_ok=True)
     plot_baseline_comparison(results_dir / "baseline_comparison.csv", figures_dir)
     plot_confusion_matrix(results_dir / "metrics.json", figures_dir)
     plot_overhead(results_dir / "metrics.json", figures_dir)
     plot_runnable_wait(results_dir / "features.csv", figures_dir)
+    plot_throughput(results_dir / "throughput_summary.csv", figures_dir)
 
 def main():
     if len(sys.argv) < 2:
